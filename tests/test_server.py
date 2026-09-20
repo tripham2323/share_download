@@ -1,11 +1,21 @@
 import hashlib
 import socket
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 from protocol import PROTOCOL_VERSION, recv_frame, send_frame
 from server import FileServer
+
+
+class ClosingChunkServer(FileServer):
+    def _send_chunk(self, client, header):
+        try:
+            client.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        client.close()
 
 
 class FileServerTests(unittest.TestCase):
@@ -102,6 +112,36 @@ class FileServerTests(unittest.TestCase):
 
         self.assertEqual("ERROR", header["type"])
         self.assertEqual("FILE_NOT_FOUND", header["code"])
+
+    def test_server_side_disconnect_does_not_escape_handler_thread(self):
+        exceptions = []
+        original_hook = threading.excepthook
+        threading.excepthook = lambda args: exceptions.append(args.exc_value)
+        closing_server = ClosingChunkServer(
+            self.path, "127.0.0.1", 0, read_timeout=1
+        )
+        closing_server.start()
+        try:
+            sock = socket.create_connection(closing_server.address, timeout=1)
+            send_frame(
+                sock,
+                {
+                    "version": PROTOCOL_VERSION,
+                    "type": "GET_CHUNK",
+                    "filename": "config.dat",
+                    "chunk_id": 0,
+                    "offset": 0,
+                    "length": 4,
+                },
+            )
+            with self.assertRaises(ConnectionError):
+                recv_frame(sock)
+            sock.close()
+            closing_server.shutdown()
+            self.assertEqual([], exceptions)
+        finally:
+            closing_server.shutdown()
+            threading.excepthook = original_hook
 
 
 if __name__ == "__main__":

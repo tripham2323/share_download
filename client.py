@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from hashlib import sha256
 import json
 from pathlib import Path
 import socket
+import threading
+import time
 from typing import Any
 
+from file_utils import (
+    build_chunks,
+    prepare_part_file,
+    publish_part_file,
+    sha256_file,
+)
 from protocol import MAX_CHUNK_SIZE, PROTOCOL_VERSION, ProtocolError, recv_frame, send_frame
+from scheduler import Chunk, ChunkScheduler
 
 
 class DownloadError(Exception):
@@ -39,6 +50,27 @@ class ClientConfig:
     connect_timeout: float = 5.0
     read_timeout: float = 60.0
     reconnect_attempts: int = 3
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadResult:
+    output: Path
+    file_sha256: str
+    bytes_written: int
+    per_server_chunks: dict[str, int]
+    per_server_bytes: dict[str, int]
+    per_server_kbps: dict[str, float]
+
+
+@dataclass(slots=True)
+class _WorkerStats:
+    chunks: int = 0
+    bytes_received: int = 0
+    elapsed_seconds: float = 0.0
+
+
+class _ServerDataError(Exception):
+    pass
 
 
 def load_config(path: str | Path) -> ClientConfig:
@@ -169,6 +201,185 @@ def select_consistent_servers(
     if len(results) == 1 or len(endpoints) > len(results) / 2:
         return metadata, endpoints
     raise DownloadError("no metadata majority among responding servers")
+
+
+def download(config: ClientConfig) -> DownloadResult:
+    metadata_results = _query_all_metadata(config)
+    metadata, endpoints = select_consistent_servers(metadata_results)
+    chunks = build_chunks(metadata.file_size, config.chunk_size)
+    scheduler = ChunkScheduler(chunks)
+    part_path = prepare_part_file(config.output, metadata.file_size)
+    stats = {endpoint.name: _WorkerStats() for endpoint in endpoints}
+
+    if chunks:
+        write_lock = threading.Lock()
+        start_barrier = threading.Barrier(len(endpoints))
+        with part_path.open("r+b") as target:
+            workers = [
+                threading.Thread(
+                    target=_download_worker,
+                    name=f"download-{endpoint.name}",
+                    args=(
+                        endpoint,
+                        config,
+                        scheduler,
+                        target,
+                        write_lock,
+                        start_barrier,
+                        stats[endpoint.name],
+                    ),
+                )
+                for endpoint in endpoints
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+
+        if scheduler.has_unfinished():
+            raise DownloadError("all usable servers failed before download completed")
+
+    actual_sha256 = sha256_file(part_path)
+    if actual_sha256 != metadata.file_sha256:
+        raise DownloadError(
+            "downloaded file SHA-256 does not match server metadata"
+        )
+    publish_part_file(part_path, config.output)
+
+    return DownloadResult(
+        output=config.output,
+        file_sha256=actual_sha256,
+        bytes_written=metadata.file_size,
+        per_server_chunks={name: item.chunks for name, item in stats.items()},
+        per_server_bytes={
+            name: item.bytes_received for name, item in stats.items()
+        },
+        per_server_kbps={
+            name: (
+                (item.bytes_received * 8 / 1000) / item.elapsed_seconds
+                if item.bytes_received and item.elapsed_seconds > 0
+                else 0.0
+            )
+            for name, item in stats.items()
+        },
+    )
+
+
+def _query_all_metadata(
+    config: ClientConfig,
+) -> list[tuple[ServerEndpoint, FileMetadata]]:
+    results: list[tuple[ServerEndpoint, FileMetadata]] = []
+    with ThreadPoolExecutor(max_workers=len(config.servers)) as executor:
+        futures = {
+            executor.submit(query_metadata, endpoint, config): endpoint
+            for endpoint in config.servers
+        }
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except DownloadError:
+                continue
+    return results
+
+
+def _download_worker(
+    endpoint: ServerEndpoint,
+    config: ClientConfig,
+    scheduler: ChunkScheduler,
+    target,
+    write_lock: threading.Lock,
+    start_barrier: threading.Barrier,
+    stats: _WorkerStats,
+) -> None:
+    started = time.monotonic()
+    failures = 0
+    try:
+        start_barrier.wait()
+        while scheduler.has_unfinished() and failures <= config.reconnect_attempts:
+            try:
+                sock = socket.create_connection(
+                    (endpoint.host, endpoint.port),
+                    timeout=config.connect_timeout,
+                )
+                sock.settimeout(config.read_timeout)
+            except OSError:
+                failures += 1
+                continue
+
+            try:
+                while scheduler.has_unfinished():
+                    chunk = scheduler.acquire(timeout=0.1)
+                    if chunk is None:
+                        continue
+                    try:
+                        payload = _request_chunk(sock, endpoint, config, chunk)
+                    except (OSError, ConnectionError, socket.timeout):
+                        scheduler.retry(chunk)
+                        failures += 1
+                        break
+                    except (ProtocolError, _ServerDataError):
+                        scheduler.retry(chunk)
+                        return
+
+                    with write_lock:
+                        target.seek(chunk.offset)
+                        written = target.write(payload)
+                        if written != chunk.length:
+                            scheduler.retry(chunk)
+                            return
+                    scheduler.complete(chunk)
+                    stats.chunks += 1
+                    stats.bytes_received += len(payload)
+                    failures = 0
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    except threading.BrokenBarrierError:
+        return
+    finally:
+        stats.elapsed_seconds = max(time.monotonic() - started, 0.0)
+
+
+def _request_chunk(
+    sock: socket.socket,
+    endpoint: ServerEndpoint,
+    config: ClientConfig,
+    chunk: Chunk,
+) -> bytes:
+    send_frame(
+        sock,
+        {
+            "version": PROTOCOL_VERSION,
+            "type": "GET_CHUNK",
+            "filename": config.filename,
+            "chunk_id": chunk.chunk_id,
+            "offset": chunk.offset,
+            "length": chunk.length,
+        },
+    )
+    header, payload = recv_frame(sock, max_payload=chunk.length)
+    if header["type"] == "ERROR":
+        raise _ServerDataError(
+            f"{endpoint.name}: {header.get('code', 'ERROR')}: "
+            f"{header.get('message', 'chunk request failed')}"
+        )
+    if (
+        header["type"] != "CHUNK_DATA"
+        or header.get("status") != "OK"
+        or header.get("chunk_id") != chunk.chunk_id
+        or header.get("offset") != chunk.offset
+        or header.get("length") != chunk.length
+        or len(payload) != chunk.length
+    ):
+        raise _ServerDataError(f"{endpoint.name}: invalid chunk response")
+    chunk_sha256 = header.get("chunk_sha256")
+    if not _is_sha256(chunk_sha256):
+        raise _ServerDataError(f"{endpoint.name}: invalid chunk SHA-256")
+    if sha256(payload).hexdigest() != chunk_sha256.lower():
+        raise _ServerDataError(f"{endpoint.name}: chunk SHA-256 mismatch")
+    return payload
 
 
 def _integer_setting(

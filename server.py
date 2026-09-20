@@ -159,6 +159,8 @@ class FileServer:
                     self._send_error(client, exc.code, exc.message)
                 except OSError:
                     self._send_error(client, "INTERNAL_ERROR", "unable to read configured file")
+        except OSError:
+            pass
         finally:
             with self._state_lock:
                 self._clients.discard(client)
