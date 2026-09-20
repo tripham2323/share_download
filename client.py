@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -9,9 +10,10 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import socket
+import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from file_utils import (
     build_chunks,
@@ -60,6 +62,7 @@ class DownloadResult:
     per_server_chunks: dict[str, int]
     per_server_bytes: dict[str, int]
     per_server_kbps: dict[str, float]
+    unused_servers: tuple[str, ...]
 
 
 @dataclass(slots=True)
@@ -203,7 +206,10 @@ def select_consistent_servers(
     raise DownloadError("no metadata majority among responding servers")
 
 
-def download(config: ClientConfig) -> DownloadResult:
+def download(
+    config: ClientConfig,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> DownloadResult:
     metadata_results = _query_all_metadata(config)
     metadata, endpoints = select_consistent_servers(metadata_results)
     chunks = build_chunks(metadata.file_size, config.chunk_size)
@@ -227,6 +233,7 @@ def download(config: ClientConfig) -> DownloadResult:
                         write_lock,
                         start_barrier,
                         stats[endpoint.name],
+                        progress_callback,
                     ),
                 )
                 for endpoint in endpoints
@@ -262,6 +269,11 @@ def download(config: ClientConfig) -> DownloadResult:
             )
             for name, item in stats.items()
         },
+        unused_servers=tuple(
+            endpoint.name
+            for endpoint in config.servers
+            if endpoint not in endpoints
+        ),
     )
 
 
@@ -290,6 +302,7 @@ def _download_worker(
     write_lock: threading.Lock,
     start_barrier: threading.Barrier,
     stats: _WorkerStats,
+    progress_callback: Callable[[int, int], None] | None,
 ) -> None:
     started = time.monotonic()
     failures = 0
@@ -331,6 +344,11 @@ def _download_worker(
                     stats.chunks += 1
                     stats.bytes_received += len(payload)
                     failures = 0
+                    if progress_callback is not None:
+                        progress_callback(
+                            scheduler.completed_count(),
+                            scheduler.total_count,
+                        )
             finally:
                 try:
                     sock.close()
@@ -409,3 +427,68 @@ def _is_sha256(value: Any) -> bool:
     except ValueError:
         return False
     return True
+
+
+class _ProgressPrinter:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last_completed = -1
+
+    def __call__(self, completed: int, total: int) -> None:
+        with self._lock:
+            if completed != self._last_completed:
+                self._last_completed = completed
+                percent = completed * 100 / total if total else 100.0
+                print(f"Progress: {completed}/{total} ({percent:.1f}%)")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Download one file from multiple TCP servers"
+    )
+    parser.add_argument("--config", required=True, type=Path)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        config = load_config(args.config)
+        print("Connecting:")
+        for endpoint in config.servers:
+            print(f"  {endpoint.name} {endpoint.host}:{endpoint.port}")
+        result = download(config, progress_callback=_ProgressPrinter())
+    except (DownloadError, OSError, ValueError) as exc:
+        print(f"Download error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"File size: {_format_size(result.bytes_written)}")
+    for name in result.per_server_chunks:
+        print(
+            f"  {name}: {result.per_server_chunks[name]} chunks, "
+            f"{result.per_server_bytes[name]} bytes, "
+            f"{result.per_server_kbps[name]:.1f} Kbps"
+        )
+    if result.unused_servers:
+        print(
+            "Warning: unused servers: "
+            + ", ".join(result.unused_servers),
+            file=sys.stderr,
+        )
+    if result.bytes_written == 0:
+        print("Progress: 0/0 (100.0%)")
+    print(f"SHA-256 verified: {result.file_sha256}")
+    print(f"Saved: {result.output}")
+    return 0
+
+
+def _format_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.2f} KiB"
+    return f"{size / (1024 * 1024):.2f} MiB"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

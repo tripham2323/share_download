@@ -198,6 +198,7 @@ class ParallelDownloadTests(unittest.TestCase):
         result = download(self.config_for(endpoints))
 
         self.assertEqual({"S1", "S2"}, set(result.per_server_chunks))
+        self.assertEqual(("S3",), result.unused_servers)
         self.assertEqual(self.source_bytes, result.output.read_bytes())
 
     def test_reassigns_chunk_when_server_disconnects(self):
