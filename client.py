@@ -92,6 +92,10 @@ def load_config(path: str | Path) -> ClientConfig:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid JSON config: {exc}") from exc
+    return parse_config(raw, config_path.parent)
+
+
+def parse_config(raw: dict[str, Any], base_dir: Path) -> ClientConfig:
     if not isinstance(raw, dict):
         raise ValueError("config root must be a JSON object")
 
@@ -133,7 +137,7 @@ def load_config(path: str | Path) -> ClientConfig:
         raise ValueError("output must be a non-empty path")
     output = Path(output_value)
     if not output.is_absolute():
-        output = config_path.parent / output
+        output = base_dir / output
 
     chunk_size = _integer_setting(raw, "chunk_size", 262_144, minimum=1)
     if chunk_size > MAX_CHUNK_SIZE:
@@ -400,6 +404,9 @@ def _download_worker(
                     sock.close()
                 except OSError:
                     pass
+        if failures:
+            emit(DownloadEvent("server_failed", server=endpoint.name,
+                               message="Unable to continue serving chunks"))
     except threading.BrokenBarrierError:
         return
     finally:

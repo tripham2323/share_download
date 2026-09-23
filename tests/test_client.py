@@ -12,7 +12,7 @@ from client import (
     ServerEndpoint,
     download,
     load_config,
-    query_metadata,
+    parse_config,
     select_consistent_servers,
 )
 from server import FileServer
@@ -80,6 +80,12 @@ class ClientConfigTests(unittest.TestCase):
             self.assertEqual(2, len(config.servers))
             self.assertEqual(Path(directory, "downloads", "config.dat"), config.output)
             self.assertEqual(262144, config.chunk_size)
+
+    def test_parses_in_memory_form_like_saved_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(directory)
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(load_config(path), parse_config(raw, path.parent))
 
     def test_rejects_duplicate_server_names(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -228,6 +234,22 @@ class ParallelDownloadTests(unittest.TestCase):
 
         self.assertEqual(self.source_bytes, result.output.read_bytes())
         self.assertEqual(0, result.per_server_chunks["S3"])
+    def test_reports_failed_server_after_reassignment(self):
+        endpoints = [
+            self.start_server("S1"),
+            self.start_server("S2"),
+            self.start_server("S3", server_type=DisconnectOnChunkServer),
+        ]
+        events = []
+
+        result = download(self.config_for(endpoints), event_callback=events.append)
+
+        self.assertEqual(self.source_bytes, result.output.read_bytes())
+        self.assertTrue(any(event.kind == "chunk_requeued" and event.server == "S3"
+                            for event in events))
+        self.assertTrue(any(event.kind == "server_failed" and event.server == "S3"
+                            for event in events))
+
 
 
 if __name__ == "__main__":
