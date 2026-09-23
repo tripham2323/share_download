@@ -25,6 +25,14 @@ class SchedulerTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             scheduler.complete(chunk)
 
+    def test_skips_verified_chunks_when_resuming(self):
+        first, second = Chunk(0, 0, 4), Chunk(1, 4, 4)
+        scheduler = ChunkScheduler([first, second], completed_ids=frozenset({0}))
+        self.assertEqual(1, scheduler.completed_count())
+        self.assertEqual(second, scheduler.acquire(timeout=0.01))
+        scheduler.complete(second)
+        self.assertTrue(scheduler.all_completed())
+
     def test_empty_scheduler_is_complete(self):
         scheduler = ChunkScheduler([])
         self.assertTrue(scheduler.all_completed())

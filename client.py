@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from typing import Any, Callable
+from checkpoint import CheckpointIdentity, CheckpointStore, load_checkpoint, state_path_for
 
 from file_utils import (
     build_chunks,
@@ -205,21 +206,28 @@ def parse_config(raw: dict[str, Any], base_dir: Path) -> ClientConfig:
 def query_metadata(
     endpoint: ServerEndpoint,
     config: ClientConfig,
+    controller: DownloadController | None = None,
 ) -> tuple[ServerEndpoint, FileMetadata]:
     try:
         with socket.create_connection(
             (endpoint.host, endpoint.port), timeout=config.connect_timeout
         ) as sock:
             sock.settimeout(config.read_timeout)
-            send_frame(
-                sock,
-                {
-                    "version": PROTOCOL_VERSION,
-                    "type": "FILE_INFO_REQUEST",
-                    "filename": config.filename,
-                },
-            )
-            header, payload = recv_frame(sock, max_payload=0)
+            if controller is not None:
+                controller.register(sock)
+            try:
+                send_frame(
+                    sock,
+                    {
+                        "version": PROTOCOL_VERSION,
+                        "type": "FILE_INFO_REQUEST",
+                        "filename": config.filename,
+                    },
+                )
+                header, payload = recv_frame(sock, max_payload=0)
+            finally:
+                if controller is not None:
+                    controller.unregister(sock)
     except (OSError, ConnectionError, ProtocolError) as exc:
         raise DownloadError(f"{endpoint.name}: metadata request failed: {exc}") from exc
 
@@ -269,6 +277,7 @@ def download(
     *,
     event_callback: Callable[[DownloadEvent], None] | None = None,
     controller: DownloadController | None = None,
+    resume: bool = False,
 ) -> DownloadResult:
     event_lock = threading.Lock()
 
@@ -279,24 +288,36 @@ def download(
     control = controller or DownloadController()
     control.check()
 
-    metadata_results = _query_all_metadata(config, emit)
+    metadata_results = _query_all_metadata(config, emit, control)
     control.check()
     metadata, endpoints = select_consistent_servers(metadata_results)
     chunks = build_chunks(metadata.file_size, config.chunk_size)
-    scheduler = ChunkScheduler(chunks)
-    emit(DownloadEvent("metadata", completed_chunks=0, total_chunks=len(chunks),
+    part_path = config.output.with_name(config.output.name + ".part")
+    identity = CheckpointIdentity(metadata.filename, metadata.file_size,
+                                  metadata.file_sha256, config.chunk_size)
+    if resume:
+        verified = load_checkpoint(part_path, identity, chunks)
+        if not part_path.exists():
+            prepare_part_file(config.output, metadata.file_size)
+    else:
+        state_path_for(part_path).unlink(missing_ok=True)
+        prepare_part_file(config.output, metadata.file_size)
+        verified = {}
+    scheduler = ChunkScheduler(chunks, completed_ids=frozenset(verified))
+    checkpoint = CheckpointStore(part_path, identity, verified) if resume else None
+    emit(DownloadEvent("metadata", completed_chunks=len(verified), total_chunks=len(chunks),
                        message=f"{metadata.file_size} bytes; SHA-256 {metadata.file_sha256}"))
     for endpoint in config.servers:
         if endpoint not in endpoints:
             emit(DownloadEvent("server_excluded", server=endpoint.name,
                                message="Unavailable or different file version"))
     control.check()
-    part_path = prepare_part_file(config.output, metadata.file_size)
     stats = {endpoint.name: _WorkerStats() for endpoint in endpoints}
 
-    if chunks:
+    if scheduler.has_unfinished():
         write_lock = threading.Lock()
         start_barrier = threading.Barrier(len(endpoints))
+        worker_errors: list[Exception] = []
         with part_path.open("r+b") as target:
             workers = [
                 threading.Thread(
@@ -313,6 +334,8 @@ def download(
                         progress_callback,
                         emit,
                         control,
+                        checkpoint,
+                        worker_errors,
                     ),
                 )
                 for endpoint in endpoints
@@ -321,7 +344,11 @@ def download(
                 worker.start()
             for worker in workers:
                 worker.join()
+            if checkpoint is not None:
+                checkpoint.flush(target)
 
+        if worker_errors:
+            raise DownloadError(f"unable to write downloaded chunk: {worker_errors[0]}") from worker_errors[0]
         control.check()
         if scheduler.has_unfinished():
             raise DownloadError("all usable servers failed before download completed")
@@ -335,6 +362,8 @@ def download(
             "downloaded file SHA-256 does not match server metadata"
         )
     control.publish(part_path, config.output)
+    if checkpoint is not None:
+        checkpoint.state_path.unlink(missing_ok=True)
     emit(DownloadEvent("completed", completed_chunks=scheduler.completed_count(),
                        total_chunks=scheduler.total_count))
 
@@ -365,11 +394,12 @@ def download(
 def _query_all_metadata(
     config: ClientConfig,
     emit: Callable[[DownloadEvent], None] | None = None,
+    controller: DownloadController | None = None,
 ) -> list[tuple[ServerEndpoint, FileMetadata]]:
     results: list[tuple[ServerEndpoint, FileMetadata]] = []
     with ThreadPoolExecutor(max_workers=len(config.servers)) as executor:
         futures = {
-            executor.submit(query_metadata, endpoint, config): endpoint
+            executor.submit(query_metadata, endpoint, config, controller): endpoint
             for endpoint in config.servers
         }
         for future in as_completed(futures):
@@ -393,6 +423,8 @@ def _download_worker(
     progress_callback: Callable[[int, int], None] | None,
     emit: Callable[[DownloadEvent], None],
     controller: DownloadController,
+    checkpoint: CheckpointStore | None,
+    worker_errors: list[Exception],
 ) -> None:
     started = time.monotonic()
     failures = 0
@@ -421,7 +453,7 @@ def _download_worker(
                     if chunk is None:
                         continue
                     try:
-                        payload = _request_chunk(sock, endpoint, config, chunk)
+                        payload, digest = _request_chunk(sock, endpoint, config, chunk)
                         if controller.cancelled.is_set():
                             scheduler.retry(chunk)
                             break
@@ -443,9 +475,12 @@ def _download_worker(
                         target.seek(chunk.offset)
                         written = target.write(payload)
                         if written != chunk.length:
-                            scheduler.retry(chunk)
-                            return
-                    scheduler.complete(chunk)
+                            raise OSError("short write to partial file")
+                        if checkpoint is not None:
+                            checkpoint.record(chunk, digest)
+                            if len(checkpoint.pending) >= 16:
+                                checkpoint.flush(target)
+                        scheduler.complete(chunk)
                     stats.chunks += 1
                     stats.bytes_received += len(payload)
                     failures = 0
@@ -469,6 +504,9 @@ def _download_worker(
                                message="Unable to continue serving chunks"))
     except threading.BrokenBarrierError:
         return
+    except Exception as exc:
+        worker_errors.append(exc)
+        controller.cancel()
     finally:
         stats.elapsed_seconds = max(time.monotonic() - started, 0.0)
 
@@ -478,7 +516,7 @@ def _request_chunk(
     endpoint: ServerEndpoint,
     config: ClientConfig,
     chunk: Chunk,
-) -> bytes:
+) -> tuple[bytes, str]:
     send_frame(
         sock,
         {
@@ -510,7 +548,7 @@ def _request_chunk(
         raise _ServerDataError(f"{endpoint.name}: invalid chunk SHA-256")
     if sha256(payload).hexdigest() != chunk_sha256.lower():
         raise _ServerDataError(f"{endpoint.name}: chunk SHA-256 mismatch")
-    return payload
+    return payload, chunk_sha256.lower()
 
 
 def _integer_setting(

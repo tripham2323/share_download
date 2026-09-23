@@ -162,6 +162,20 @@ class StallSecondChunkServer(FileServer):
         super()._send_chunk(client, header)
 
 
+class StallMetadataServer(FileServer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.blocked = threading.Event()
+        self.release = threading.Event()
+
+    def _dispatch(self, client, header):
+        if header["type"] == "FILE_INFO_REQUEST":
+            self.blocked.set()
+            self.release.wait(timeout=5)
+            return
+        super()._dispatch(client, header)
+
+
 class ParallelDownloadTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -307,6 +321,35 @@ class ParallelDownloadTests(unittest.TestCase):
             download(self.config_for([endpoint]), controller=controller,
                      event_callback=cancel_on_verifying)
         self.assertFalse((self.root / "downloaded.dat").exists())
+
+
+    def test_cancel_while_metadata_waits_on_socket(self):
+        server = StallMetadataServer(self.source, "127.0.0.1", 0, read_timeout=5)
+        server.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.release.set)
+        endpoint = ServerEndpoint("S1", *server.address)
+        config = self.config_for([endpoint])
+        controller = DownloadController()
+        outcome = {}
+
+        def run():
+            try:
+                download(config, controller=controller)
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            self.assertTrue(server.blocked.wait(timeout=2))
+            controller.cancel()
+            thread.join(timeout=0.7)
+            self.assertFalse(thread.is_alive(), "cancel must interrupt metadata socket")
+            self.assertIsInstance(outcome.get("error"), DownloadCancelled)
+        finally:
+            server.release.set()
+            thread.join(timeout=3)
 
 
 if __name__ == "__main__":

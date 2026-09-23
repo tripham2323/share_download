@@ -21,17 +21,21 @@ class Chunk:
 class ChunkScheduler:
     """Own chunk state transitions and distribute pending work safely."""
 
-    def __init__(self, chunks: list[Chunk]):
+    def __init__(self, chunks: list[Chunk], completed_ids: frozenset[int] = frozenset()):
         identifiers = [chunk.chunk_id for chunk in chunks]
         if len(set(identifiers)) != len(identifiers):
             raise ValueError("chunk identifiers must be unique")
+        if not completed_ids.issubset(identifiers):
+            raise ValueError("completed chunk identifiers must be known")
 
         self._queue: Queue[Chunk] = Queue()
         self._chunks = {chunk.chunk_id: chunk for chunk in chunks}
-        self._state = {chunk.chunk_id: "PENDING" for chunk in chunks}
+        self._state = {chunk.chunk_id: ("COMPLETED" if chunk.chunk_id in completed_ids else "PENDING")
+                       for chunk in chunks}
         self._lock = Lock()
         for chunk in chunks:
-            self._queue.put(chunk)
+            if chunk.chunk_id not in completed_ids:
+                self._queue.put(chunk)
 
     @property
     def total_count(self) -> int:
