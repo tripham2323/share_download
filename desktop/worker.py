@@ -4,13 +4,11 @@ from __future__ import annotations
 
 from collections import defaultdict
 import threading
-from typing import Any
-
 from PySide6.QtCore import QObject, Signal, Slot
 
 from client import (
-    ClientConfig, DownloadEvent, DownloadResult, download, query_metadata,
-    select_consistent_servers,
+    ClientConfig, DownloadController, DownloadEvent, DownloadResult, download,
+    query_metadata, select_consistent_servers,
 )
 
 
@@ -49,9 +47,10 @@ class DownloadWorker(QObject):
     finished = Signal(object)
     failed = Signal(object)
 
-    def __init__(self, config: ClientConfig):
+    def __init__(self, config: ClientConfig, controller: DownloadController):
         super().__init__()
         self.config = config
+        self.controller = controller
         self._lock = threading.Lock()
         self._latest: DownloadEvent | None = None
         self._bytes: dict[str, int] = defaultdict(int)
@@ -75,6 +74,7 @@ class DownloadWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            self.finished.emit(download(self.config, event_callback=self._event))
+            self.finished.emit(download(self.config, event_callback=self._event,
+                                        controller=self.controller))
         except Exception as exc:
             self.failed.emit(exc)

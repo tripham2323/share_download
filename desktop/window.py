@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from client import ClientConfig, DownloadEvent, DownloadResult
+from client import ClientConfig, DownloadCancelled, DownloadController, DownloadEvent, DownloadResult
 from desktop.config_form import ConfigForm
 from desktop.theme import STYLESHEET
 from desktop.worker import DownloadWorker, MetadataWorker
@@ -48,6 +48,7 @@ class MainWindow(QMainWindow):
         self._worker: DownloadWorker | MetadataWorker | None = None
         self._running = False
         self._close_after_work = False
+        self._controller: DownloadController | None = None
         self._server_rows: dict[str, int] = {}
         self._history: deque[tuple[float, dict[str, int]]] = deque()
         self._last_bytes: dict[str, int] = {}
@@ -155,6 +156,7 @@ class MainWindow(QMainWindow):
         heading.addWidget(self.start_button)
         self.cancel_button = QPushButton("Hủy tải")
         self.cancel_button.setObjectName("danger")
+        self.cancel_button.clicked.connect(self._cancel_download)
         self.cancel_button.setVisible(False)
         heading.addWidget(self.cancel_button)
         layout.addLayout(heading)
@@ -339,7 +341,8 @@ class MainWindow(QMainWindow):
                 return
         self._show_page(0)
         self._reset_session(config)
-        worker = DownloadWorker(config)
+        self._controller = DownloadController()
+        worker = DownloadWorker(config, self._controller)
         def connect(w, thread):
             w.status.connect(self._download_event)
             w.finished.connect(self._download_finished)
@@ -363,7 +366,7 @@ class MainWindow(QMainWindow):
         self._last_bytes = {}
         self.activity_list.clear()
         self.cancel_button.setVisible(True)
-        self.cancel_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
         self._populate_servers(config)
 
     def _download_event(self, event: DownloadEvent):
@@ -435,12 +438,18 @@ class MainWindow(QMainWindow):
 
     def _download_failed(self, error: Exception):
         self._poll_progress()
+        self.cancel_button.setVisible(False)
+        if isinstance(error, DownloadCancelled):
+            self.state = "cancelled"
+            self.status_label.setText("ĐÃ HỦY · DỮ LIỆU TẠM ĐƯỢC GIỮ LẠI")
+            self._log("Đã hủy phiên tải; tệp .part chưa được công bố")
+            return
         self.state = "error"
         self.status_label.setText("TẢI THẤT BẠI")
         self.integrity_value.setText("Chưa xác minh")
-        self.cancel_button.setVisible(False)
         self._log(f"Lỗi: {error}")
-        QMessageBox.warning(self, "Không thể hoàn tất tải", str(error))
+        if not self._close_after_work:
+            QMessageBox.warning(self, "Không thể hoàn tất tải", str(error))
 
     def _log(self, message: str):
         timestamp = time.strftime("%H:%M:%S")
@@ -452,9 +461,35 @@ class MainWindow(QMainWindow):
         if self.full_log.count() > 500:
             self.full_log.takeItem(0)
 
+    def _cancel_download(self, *, confirm: bool = True):
+        if self._controller is None or not self._running:
+            return
+        if confirm:
+            answer = QMessageBox.question(
+                self, "Hủy phiên tải",
+                "Dừng tải? Tệp đang tải sẽ không được công bố; dữ liệu .part được giữ lại.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setText("Đang dừng…")
+        self.status_label.setText("ĐANG DỪNG PHIÊN TẢI")
+        self._controller.cancel()
+
     def closeEvent(self, event):
         if self._thread is not None and self._thread.isRunning():
+            if not self._close_after_work:
+                answer = QMessageBox.question(
+                    self, "Đóng ứng dụng", "Dừng phiên tải và thoát?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
             self._close_after_work = True
+            if isinstance(self._worker, DownloadWorker):
+                self._cancel_download(confirm=False)
             event.ignore()
             self.status_label.setText("ĐANG CHỜ PHIÊN KẾT THÚC")
         else:

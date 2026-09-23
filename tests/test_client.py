@@ -1,12 +1,15 @@
 import hashlib
 import json
 import socket
+import threading
 import tempfile
 import unittest
 from pathlib import Path
 
 from client import (
     ClientConfig,
+    DownloadCancelled,
+    DownloadController,
     DownloadError,
     FileMetadata,
     ServerEndpoint,
@@ -145,6 +148,20 @@ class DisconnectOnChunkServer(FileServer):
         client.close()
 
 
+class StallSecondChunkServer(FileServer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.blocked = threading.Event()
+        self.release = threading.Event()
+
+    def _send_chunk(self, client, header):
+        if header["chunk_id"] == 1:
+            self.blocked.set()
+            self.release.wait(timeout=10)
+            return
+        super()._send_chunk(client, header)
+
+
 class ParallelDownloadTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -250,6 +267,46 @@ class ParallelDownloadTests(unittest.TestCase):
         self.assertTrue(any(event.kind == "server_failed" and event.server == "S3"
                             for event in events))
 
+
+
+    def test_cancel_during_blocked_read(self):
+        server = StallSecondChunkServer(self.source, "127.0.0.1", 0, read_timeout=2)
+        server.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.release.set)
+        endpoint = ServerEndpoint("S1", *server.address)
+        controller = DownloadController()
+        outcome = {}
+
+        def run():
+            try:
+                download(self.config_for([endpoint]), controller=controller)
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(server.blocked.wait(timeout=3))
+        controller.cancel()
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertIsInstance(outcome.get("error"), DownloadCancelled)
+        self.assertFalse((self.root / "downloaded.dat").exists())
+        self.assertTrue((self.root / "downloaded.dat.part").exists())
+
+
+    def test_cancel_during_verification_does_not_publish(self):
+        endpoint = self.start_server("S1")
+        controller = DownloadController()
+
+        def cancel_on_verifying(event):
+            if event.kind == "verifying":
+                controller.cancel()
+
+        with self.assertRaises(DownloadCancelled):
+            download(self.config_for([endpoint]), controller=controller,
+                     event_callback=cancel_on_verifying)
+        self.assertFalse((self.root / "downloaded.dat").exists())
 
 
 if __name__ == "__main__":
