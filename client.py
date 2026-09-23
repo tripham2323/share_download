@@ -65,6 +65,16 @@ class DownloadResult:
     unused_servers: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class DownloadEvent:
+    kind: str
+    server: str | None = None
+    completed_chunks: int = 0
+    total_chunks: int = 0
+    bytes_delta: int = 0
+    message: str = ""
+
+
 @dataclass(slots=True)
 class _WorkerStats:
     chunks: int = 0
@@ -209,11 +219,26 @@ def select_consistent_servers(
 def download(
     config: ClientConfig,
     progress_callback: Callable[[int, int], None] | None = None,
+    *,
+    event_callback: Callable[[DownloadEvent], None] | None = None,
 ) -> DownloadResult:
-    metadata_results = _query_all_metadata(config)
+    event_lock = threading.Lock()
+
+    def emit(event: DownloadEvent) -> None:
+        if event_callback is not None:
+            with event_lock:
+                event_callback(event)
+
+    metadata_results = _query_all_metadata(config, emit)
     metadata, endpoints = select_consistent_servers(metadata_results)
     chunks = build_chunks(metadata.file_size, config.chunk_size)
     scheduler = ChunkScheduler(chunks)
+    emit(DownloadEvent("metadata", completed_chunks=0, total_chunks=len(chunks),
+                       message=f"{metadata.file_size} bytes; SHA-256 {metadata.file_sha256}"))
+    for endpoint in config.servers:
+        if endpoint not in endpoints:
+            emit(DownloadEvent("server_excluded", server=endpoint.name,
+                               message="Unavailable or different file version"))
     part_path = prepare_part_file(config.output, metadata.file_size)
     stats = {endpoint.name: _WorkerStats() for endpoint in endpoints}
 
@@ -234,6 +259,7 @@ def download(
                         start_barrier,
                         stats[endpoint.name],
                         progress_callback,
+                        emit,
                     ),
                 )
                 for endpoint in endpoints
@@ -246,12 +272,16 @@ def download(
         if scheduler.has_unfinished():
             raise DownloadError("all usable servers failed before download completed")
 
+    emit(DownloadEvent("verifying", completed_chunks=scheduler.completed_count(),
+                       total_chunks=scheduler.total_count))
     actual_sha256 = sha256_file(part_path)
     if actual_sha256 != metadata.file_sha256:
         raise DownloadError(
             "downloaded file SHA-256 does not match server metadata"
         )
     publish_part_file(part_path, config.output)
+    emit(DownloadEvent("completed", completed_chunks=scheduler.completed_count(),
+                       total_chunks=scheduler.total_count))
 
     return DownloadResult(
         output=config.output,
@@ -279,6 +309,7 @@ def download(
 
 def _query_all_metadata(
     config: ClientConfig,
+    emit: Callable[[DownloadEvent], None] | None = None,
 ) -> list[tuple[ServerEndpoint, FileMetadata]]:
     results: list[tuple[ServerEndpoint, FileMetadata]] = []
     with ThreadPoolExecutor(max_workers=len(config.servers)) as executor:
@@ -289,8 +320,10 @@ def _query_all_metadata(
         for future in as_completed(futures):
             try:
                 results.append(future.result())
-            except DownloadError:
-                continue
+            except DownloadError as exc:
+                if emit is not None:
+                    emit(DownloadEvent("server_failed", server=futures[future].name,
+                                       message=str(exc)))
     return results
 
 
@@ -303,6 +336,7 @@ def _download_worker(
     start_barrier: threading.Barrier,
     stats: _WorkerStats,
     progress_callback: Callable[[int, int], None] | None,
+    emit: Callable[[DownloadEvent], None],
 ) -> None:
     started = time.monotonic()
     failures = 0
@@ -315,8 +349,10 @@ def _download_worker(
                     timeout=config.connect_timeout,
                 )
                 sock.settimeout(config.read_timeout)
-            except OSError:
+                emit(DownloadEvent("server_connected", server=endpoint.name))
+            except OSError as exc:
                 failures += 1
+                emit(DownloadEvent("server_failed", server=endpoint.name, message=str(exc)))
                 continue
 
             try:
@@ -326,12 +362,18 @@ def _download_worker(
                         continue
                     try:
                         payload = _request_chunk(sock, endpoint, config, chunk)
-                    except (OSError, ConnectionError, socket.timeout):
+                    except (OSError, ConnectionError, socket.timeout) as exc:
                         scheduler.retry(chunk)
+                        emit(DownloadEvent("chunk_requeued", server=endpoint.name,
+                                           message=str(exc)))
                         failures += 1
                         break
-                    except (ProtocolError, _ServerDataError):
+                    except (ProtocolError, _ServerDataError) as exc:
                         scheduler.retry(chunk)
+                        emit(DownloadEvent("chunk_requeued", server=endpoint.name,
+                                           message=str(exc)))
+                        emit(DownloadEvent("server_failed", server=endpoint.name,
+                                           message=str(exc)))
                         return
 
                     with write_lock:
@@ -344,6 +386,10 @@ def _download_worker(
                     stats.chunks += 1
                     stats.bytes_received += len(payload)
                     failures = 0
+                    emit(DownloadEvent("chunk", server=endpoint.name,
+                                       completed_chunks=scheduler.completed_count(),
+                                       total_chunks=scheduler.total_count,
+                                       bytes_delta=len(payload)))
                     if progress_callback is not None:
                         progress_callback(
                             scheduler.completed_count(),

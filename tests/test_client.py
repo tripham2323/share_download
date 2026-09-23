@@ -185,6 +185,22 @@ class ParallelDownloadTests(unittest.TestCase):
         self.assertEqual(len(self.source_bytes), sum(result.per_server_bytes.values()))
         self.assertTrue(all(speed >= 0 for speed in result.per_server_kbps.values()))
 
+    def test_emits_structured_events(self):
+        endpoints = [self.start_server("S1"), self.start_server("S2")]
+        events = []
+
+        result = download(self.config_for(endpoints), event_callback=events.append)
+
+        kinds = [event.kind for event in events]
+        self.assertLess(kinds.index("metadata"), kinds.index("chunk"))
+        self.assertLess(kinds.index("chunk"), kinds.index("verifying"))
+        self.assertLess(kinds.index("verifying"), kinds.index("completed"))
+        self.assertEqual(
+            len(self.source_bytes),
+            sum(event.bytes_delta for event in events if event.kind == "chunk"),
+        )
+        self.assertEqual(self.source_bytes, result.output.read_bytes())
+
     def test_excludes_server_with_different_file(self):
         different = self.root / "different" / "config.dat"
         different.parent.mkdir()
