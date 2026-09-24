@@ -56,32 +56,26 @@ Mỗi thông điệp TCP gồm:
 
 ```text
 share_download/
-├── client.py
-├── desktop_app.py
-├── desktop/
-│   ├── config_form.py
-│   ├── window.py
-│   └── summary.py
-├── checkpoint.py
-├── server.py
-├── protocol.py
-├── scheduler.py
-├── file_utils.py
-├── requirements-desktop.txt
-├── client_config.example.json
-├── docs/
-│   └── superpowers/
-│       ├── specs/
-│       └── plans/
-└── tests/
-
-- `server.py`: phục vụ metadata và vùng byte của file.
-- `client.py`: tải đồng thời, lập lịch chunk, kiểm tra hash và giao diện CLI.
-- `protocol.py`: đóng khung thông điệp TCP.
-- `scheduler.py`: quản lý trạng thái và hàng đợi chunk.
-- `file_utils.py`: chia chunk, tính SHA-256 và quản lý file tạm.
-- `desktop_app.py`: mở giao diện Qt; `desktop/`: cấu hình, giám sát và báo cáo phiên.
-- `checkpoint.py`: ghi checkpoint theo chunk vào `<output>.part.state.json` để tiếp tục an toàn.
+├── client.py               # Tải đồng thời đa luồng, lập lịch chunk, hỗ trợ --visual & --resume
+├── server.py               # Phục vụ metadata và vùng byte của file qua TCP socket
+├── protocol.py             # Đóng khung thông điệp TCP (4-byte length prefix + JSON + binary)
+├── scheduler.py            # Quản lý hàng đợi và lập lịch phân phối chunk thích nghi động
+├── file_utils.py           # Pre-allocation file .part, băm SHA-256 và atomic rename publish
+├── checkpoint.py           # Ghi checkpoint bền vững, xác minh lại hash trên đĩa khi resume
+├── dashboard.py            # Terminal Live Dashboard trực quan hóa băng thông và chunk map
+├── desktop_app.py          # Ứng dụng Desktop GUI bằng PySide6
+├── desktop/                # Các thành phần giao diện người dùng Desktop (window, form, summary)
+├── tools/                  # Bộ công cụ giả lập mạng và demo thực nghiệm
+│   ├── simulate.py         # Script demo trực quan tự động (failover, nghẽn mạng, rớt gói)
+│   └── simulator/          # TokenBucket rate limiter và proxy router trung chuyển
+├── docs/                   # Tài liệu thiết kế, đặc tả và cẩm nang đồ án
+│   ├── PROTOCOL.md         # Đặc tả giao thức truyền thông tầng ứng dụng chuẩn RFC
+│   ├── defense_guide.md    # Cẩm nang vấn đáp và kịch bản bảo vệ đồ án
+│   └── test_plan.md        # Kế hoạch kiểm thử và nghiệm thu chi tiết
+├── client_config.json      # File cấu hình mẫu sẵn sàng kết nối 3 máy chủ
+└── tests/                  # Bộ kiểm thử toàn diện Unit, Integration và E2E Matrix
+    └── e2e/test_matrix.py  # Ma trận 6 kịch bản kiểm thử E2E tự động
+```
 
 ## Giao diện desktop trên C1
 
@@ -199,8 +193,22 @@ Các thuộc tính:
 
 ## 4. Chạy client
 
+Chạy chế độ trực quan (Terminal Live Visual Dashboard):
+
+```bash
+python client.py --config client_config.json --visual
+```
+
+Chạy chế độ dòng lệnh cơ bản:
+
 ```bash
 python client.py --config client_config.json
+```
+
+Tiếp tục tải dở dang từ checkpoint:
+
+```bash
+python client.py --config client_config.json --visual --resume
 ```
 
 Kết quả mẫu:
@@ -340,17 +348,48 @@ Hash nguồn và file tải về phải giống nhau.
 
 Với file 10 MiB trên localhost, quá trình có thể kết thúc rất nhanh. Khi demo có thể dùng file lớn hơn hoặc giới hạn băng thông VM để dễ quan sát.
 
-# Chạy kiểm thử
+# Công cụ mô phỏng mạng và Demo trực quan
+
+Hệ thống cung cấp công cụ giả lập router phân phối lưu lượng (`tools/simulate.py`) để quan sát phản ứng của client dưới các điều kiện mạng thực tế (nghẽn mạng, bóp băng thông, rớt gói tin, server sập giữa chừng):
 
 ```bash
-python -m unittest discover -s tests -v
+# Chạy demo cân bằng tải và băng thông bất đối xứng:
+python tools/simulate.py
+
+# Giả lập rớt gói 5% trên máy chủ S2:
+python tools/simulate.py --loss 0.05
+
+# Giả lập máy chủ S3 bị sập đột ngột ở 35% tiến độ (Failover):
+python tools/simulate.py --failover
 ```
+
+# Chạy kiểm thử
+
+Chạy bộ kiểm thử tự động toàn diện bằng `pytest` hoặc `unittest`:
+
+```bash
+# Chạy toàn bộ 48+ test cases Unit/Integration:
+python -m pytest
+
+# Chạy bằng unittest chuẩn:
+python -m unittest discover -s tests -v
+
+# Chạy ma trận 6 kịch bản kiểm thử E2E thực nghiệm:
+python tests/e2e/test_matrix.py
+```
+
+# Tài liệu kỹ thuật chi tiết
+
+- **Đặc tả giao thức truyền thông RFC-style**: Xem [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
+- **Kế hoạch kiểm thử và nghiệm thu**: Xem [`docs/test_plan.md`](docs/test_plan.md)
+- **Cẩm nang bảo vệ đồ án & câu hỏi vấn đáp**: Xem [`docs/defense_guide.md`](docs/defense_guide.md)
 
 Xem trợ giúp CLI:
 
 ```bash
 python server.py --help
 python client.py --help
+python tools/simulate.py --help
 ```
 
 # Xử lý lỗi

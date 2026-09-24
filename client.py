@@ -122,6 +122,7 @@ class DownloadEvent:
     bytes_delta: int = 0
     file_size: int = 0
     verified_bytes: int = 0
+    chunk_id: int | None = None
     message: str = ""
 
 
@@ -445,30 +446,51 @@ def _download_worker(
 ) -> None:
     started = time.monotonic()
     failures = 0
+    sock = None
     try:
-        start_barrier.wait()
+        try:
+            sock = socket.create_connection(
+                (endpoint.host, endpoint.port),
+                timeout=config.connect_timeout,
+            )
+            sock.settimeout(config.read_timeout)
+            controller.register(sock)
+            emit(DownloadEvent("server_connected", server=endpoint.name))
+        except DownloadCancelled:
+            return
+        except OSError as exc:
+            failures += 1
+            emit(DownloadEvent("server_failed", server=endpoint.name, message=str(exc)))
+        finally:
+            try:
+                start_barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+
         while (scheduler.has_unfinished() and not controller.cancelled.is_set()
                and failures <= config.reconnect_attempts):
-            try:
-                sock = socket.create_connection(
-                    (endpoint.host, endpoint.port),
-                    timeout=config.connect_timeout,
-                )
-                sock.settimeout(config.read_timeout)
-                controller.register(sock)
-                emit(DownloadEvent("server_connected", server=endpoint.name))
-            except DownloadCancelled:
-                return
-            except OSError as exc:
-                failures += 1
-                emit(DownloadEvent("server_failed", server=endpoint.name, message=str(exc)))
-                continue
+            if sock is None:
+                try:
+                    sock = socket.create_connection(
+                        (endpoint.host, endpoint.port),
+                        timeout=config.connect_timeout,
+                    )
+                    sock.settimeout(config.read_timeout)
+                    controller.register(sock)
+                    emit(DownloadEvent("server_connected", server=endpoint.name))
+                except DownloadCancelled:
+                    return
+                except OSError as exc:
+                    failures += 1
+                    emit(DownloadEvent("server_failed", server=endpoint.name, message=str(exc)))
+                    continue
 
             try:
                 while scheduler.has_unfinished() and not controller.cancelled.is_set():
                     chunk = scheduler.acquire(timeout=0.1)
                     if chunk is None:
                         continue
+                    emit(DownloadEvent("chunk_start", server=endpoint.name, chunk_id=chunk.chunk_id))
                     try:
                         payload, digest = _request_chunk(sock, endpoint, config, chunk)
                         if controller.cancelled.is_set():
@@ -477,12 +499,14 @@ def _download_worker(
                     except (OSError, ConnectionError, socket.timeout) as exc:
                         scheduler.retry(chunk)
                         emit(DownloadEvent("chunk_requeued", server=endpoint.name,
+                                           chunk_id=chunk.chunk_id,
                                            message=str(exc)))
                         failures += 1
                         break
                     except (ProtocolError, _ServerDataError) as exc:
                         scheduler.retry(chunk)
                         emit(DownloadEvent("chunk_requeued", server=endpoint.name,
+                                           chunk_id=chunk.chunk_id,
                                            message=str(exc)))
                         emit(DownloadEvent("server_failed", server=endpoint.name,
                                            message=str(exc)))
@@ -502,6 +526,7 @@ def _download_worker(
                     stats.bytes_received += len(payload)
                     failures = 0
                     emit(DownloadEvent("chunk", server=endpoint.name,
+                                       chunk_id=chunk.chunk_id,
                                        completed_chunks=scheduler.completed_count(),
                                        total_chunks=scheduler.total_count,
                                        bytes_delta=len(payload)))
@@ -511,11 +536,13 @@ def _download_worker(
                             scheduler.total_count,
                         )
             finally:
-                controller.unregister(sock)
-                try:
-                    sock.close()
-                except OSError:
-                    pass
+                if sock is not None:
+                    controller.unregister(sock)
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    sock = None
         if failures and not controller.cancelled.is_set():
             emit(DownloadEvent("server_failed", server=endpoint.name,
                                message="Unable to continue serving chunks"))
@@ -614,18 +641,84 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Download one file from multiple TCP servers"
     )
-    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--config", required=True, type=Path, help="Path to JSON configuration file")
+    parser.add_argument("--visual", action="store_true", help="Enable terminal live visual dashboard")
+    parser.add_argument("--resume", action="store_true", help="Resume partial download from checkpoint")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    controller = DownloadController()
+    dashboard = None
+
     try:
         config = load_config(args.config)
-        print("Connecting:")
-        for endpoint in config.servers:
-            print(f"  {endpoint.name} {endpoint.host}:{endpoint.port}")
-        result = download(config, progress_callback=_ProgressPrinter())
+
+        event_cb = None
+        progress_cb = None
+
+        if args.visual:
+            from dashboard import VisualDashboard
+            dashboard = VisualDashboard(
+                filename=config.filename,
+                file_size=0,
+                total_chunks=0,
+                server_names=[s.name for s in config.servers],
+            )
+
+            def _on_event(ev: DownloadEvent) -> None:
+                if ev.kind == "metadata":
+                    dashboard.setup_metadata(
+                        filename=config.filename,
+                        file_size=ev.file_size,
+                        total_chunks=ev.total_chunks,
+                        server_names=[s.name for s in config.servers],
+                    )
+                elif ev.kind == "chunk_start" and ev.chunk_id is not None and ev.server:
+                    dashboard.on_chunk_start(ev.server, ev.chunk_id)
+                elif ev.kind == "chunk" and ev.server:
+                    dashboard.on_chunk_complete(
+                        ev.server,
+                        ev.chunk_id if ev.chunk_id is not None else -1,
+                        ev.bytes_delta,
+                    )
+                elif ev.kind == "chunk_requeued" and ev.server:
+                    dashboard.on_chunk_retry(
+                        ev.server,
+                        ev.chunk_id if ev.chunk_id is not None else -1,
+                    )
+                elif ev.kind in ("server_failed", "server_unavailable") and ev.server:
+                    dashboard.on_server_fail(ev.server)
+                elif ev.kind == "verifying":
+                    dashboard.set_sha256_status("Verifying SHA-256...")
+
+            event_cb = _on_event
+        else:
+            print("Connecting:")
+            for endpoint in config.servers:
+                print(f"  {endpoint.name} {endpoint.host}:{endpoint.port}")
+            progress_cb = _ProgressPrinter()
+
+        result = download(
+            config,
+            progress_callback=progress_cb,
+            event_callback=event_cb,
+            controller=controller,
+            resume=args.resume,
+            save_checkpoint=args.resume,
+        )
+
+        if dashboard:
+            dashboard.finish(result.file_sha256)
+
+    except KeyboardInterrupt:
+        controller.cancel()
+        print("\nDownload interrupted by user. Stopping cleanly...", file=sys.stderr)
+        return 130
+    except DownloadCancelled:
+        print("\nDownload cancelled.", file=sys.stderr)
+        return 130
     except (DownloadError, OSError, ValueError) as exc:
         print(f"Download error: {exc}", file=sys.stderr)
         return 1

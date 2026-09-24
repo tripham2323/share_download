@@ -5,7 +5,10 @@ __pycache__/
 downloads/*
 !downloads/.gitkeep
 *.part
+*.state
 *.part.state.json
 *.part.state.json.tmp
+*.checkpoint
+*.log
 data/*.dat
 .superpowers/
