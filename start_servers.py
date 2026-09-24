@@ -29,9 +29,9 @@ def main() -> int:
     print(" KHỞI ĐỘNG 3 FILE SERVER (S1: 5001, S2: 5002, S3: 5003)")
     print("=" * 65)
 
-    s1 = FileServer(CONFIG_FILE, "127.0.0.1", 5001)
-    s2 = FileServer(CONFIG_FILE, "127.0.0.1", 5002)
-    s3 = FileServer(CONFIG_FILE, "127.0.0.1", 5003)
+    s1 = FileServer(CONFIG_FILE, "0.0.0.0", 5001)
+    s2 = FileServer(CONFIG_FILE, "0.0.0.0", 5002)
+    s3 = FileServer(CONFIG_FILE, "0.0.0.0", 5003)
 
     s1.start()
     s2.start()
