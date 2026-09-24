@@ -319,7 +319,8 @@ class MainWindow(QMainWindow):
             if not self._server_rows:
                 self._populate_servers(config)
         self.start_button.setEnabled(valid and not self._running
-                                     and self._resume_preview is None)
+                                     and (self._resume_preview is None
+                                          or self._resume_preview.status == "none"))
         self.check_button.setEnabled(valid and not self._running)
 
     def _populate_servers(self, config: ClientConfig) -> None:

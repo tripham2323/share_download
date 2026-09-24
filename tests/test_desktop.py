@@ -2,6 +2,7 @@ import json
 import hashlib
 import os
 import tempfile
+import socket
 import time
 import unittest
 from pathlib import Path
@@ -96,6 +97,43 @@ class DesktopConfigTests(unittest.TestCase):
             self.assertTrue(window.resume_button.isVisible())
             self.assertEqual("25%", window.percent.text())
 
+
+    def test_start_after_check_downloads_from_two_available_servers(self):
+        from desktop.window import MainWindow
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "config.dat"
+            data = bytes(range(256)) * 256
+            source.write_bytes(data)
+            servers = [FileServer(source, "127.0.0.1", 0) for _ in range(2)]
+            for server in servers:
+                server.start()
+                self.addCleanup(server.shutdown)
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                unavailable_port = probe.getsockname()[1]
+            window = MainWindow()
+            self.addCleanup(window.close)
+            window.config_form.add_server("S1", "127.0.0.1", unavailable_port)
+            for number, server in enumerate(servers, 2):
+                window.config_form.add_server(f"S{number}", *server.address)
+            output = root / "received.dat"
+            window.config_form.output_input.setText(str(output))
+            window.show()
+            window._check_servers()
+            deadline = time.monotonic() + 5
+            while window._running and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(.01)
+
+            window.start_button.click()
+            while window.state == "downloading" and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(.01)
+            self.app.processEvents()
+            self.assertTrue(output.exists(), "Bắt đầu tải không khởi chạy phiên sau khi kiểm tra")
+            self.assertEqual(data, output.read_bytes())
 
 if __name__ == "__main__":
     unittest.main()

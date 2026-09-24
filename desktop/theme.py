@@ -29,6 +29,7 @@ QPushButton:focus { border: 2px solid #2563d9; }
 QPushButton:disabled { color: #596b81; background: #edf0f4; }
 QPushButton#primary { background: #2563d9; color: #ffffff; border-color: #2563d9; }
 QPushButton#primary:hover { background: #174db7; }
+QPushButton#primary:disabled { background: #edf0f4; color: #596b81; border-color: #d4dfea; }
 QPushButton#danger { color: #a7353f; border-color: #dcb7bd; }
 QPushButton#removeServer { padding: 7px 10px; }
 QProgressBar { background: #dce7f8; border: 0; border-radius: 5px; min-height: 10px; max-height: 10px; text-align: center; }
