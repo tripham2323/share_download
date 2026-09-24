@@ -18,7 +18,8 @@ from desktop.window import MainWindow
 def main() -> int:
     app = QApplication(sys.argv)
     window = MainWindow()
-    for path in (Path("client_config.json"), Path("client_config.example.json")):
+    base_dir = Path(__file__).resolve().parent
+    for path in (base_dir / "client_config.json", base_dir / "client_config.example.json"):
         if path.is_file():
             try:
                 window.config_form.load_file(path)

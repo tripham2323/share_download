@@ -8,6 +8,8 @@ from pathlib import Path
 import time
 
 from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtGui import QColor, QFont
+
 from PySide6.QtWidgets import (
     QAbstractItemView, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
     QLabel, QListWidget, QMainWindow, QMessageBox, QProgressBar,
@@ -200,7 +202,7 @@ class MainWindow(QMainWindow):
         self.percent = label("—", "percent")
         file_line.addWidget(self.percent)
         hero_layout.addLayout(file_line)
-        self.path_label = label("Cấu hình máy chủ, tệp nguồn và nơi lưu trong mục bên trái.", "muted")
+        self.path_label = label("Cấu hình máy chủ, tệp nguồn và nơi lưu trong mục bên trái.", "pathLabel")
         self.path_label.setToolTip("")
         self.path_label.setWordWrap(True)
         hero_layout.addWidget(self.path_label)
@@ -342,6 +344,18 @@ class MainWindow(QMainWindow):
             self.server_table.setItem(row, column, item)
         item.setText(value)
         item.setToolTip(value)
+        if column == 1:
+            font = item.font()
+            if value == "Đã kết nối":
+                item.setForeground(QColor("#15803d"))
+                font.setBold(True)
+            elif any(err in value for err in ("Không", "Khác", "Lỗi", "ngắt")):
+                item.setForeground(QColor("#dc2626"))
+                font.setBold(True)
+            else:
+                item.setForeground(QColor("#475569"))
+                font.setBold(False)
+            item.setFont(font)
 
     def _open_config(self):
         path, _ = QFileDialog.getOpenFileName(self, "Mở cấu hình", "", "JSON (*.json)")
@@ -450,13 +464,54 @@ class MainWindow(QMainWindow):
         self.restart_button.setVisible(True)
         self.resume_banner.show()
 
-    def _restart_download(self):
-        answer = QMessageBox.question(
-            self, "Tải lại từ đầu",
-            "Thay thế dữ liệu .part và checkpoint hiện có? Dữ liệu cũ sẽ không được dùng lại.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+    def _confirm_box(
+        self,
+        title: str,
+        heading: str,
+        body: str,
+        confirm_text: str = "Đồng ý",
+        cancel_text: str = "Hủy bỏ",
+        is_danger: bool = False,
+    ) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"<div style='font-size: 15px; font-weight: 700; color: #0f172a; margin-bottom: 6px;'>{heading}</div>")
+        box.setInformativeText(f"<div style='font-size: 13px; color: #334155; line-height: 1.5;'>{body}</div>")
+        btn_confirm = box.addButton(confirm_text, QMessageBox.ButtonRole.YesRole)
+        btn_cancel = box.addButton(cancel_text, QMessageBox.ButtonRole.NoRole)
+        box.setStyleSheet(
+            "QDialog, QMessageBox { background-color: #ffffff; color: #0f172a; }"
+            "QLabel { color: #1e293b; background: transparent; font-size: 13px; }"
+            "QPushButton { background: #ffffff; color: #1e293b; border: 1px solid #cbd5e1; "
+            "border-radius: 6px; padding: 7px 18px; min-width: 90px; font-weight: 600; font-size: 12px; }"
+            "QPushButton:hover { background: #f1f5f9; border-color: #94a3b8; }"
         )
-        if answer == QMessageBox.StandardButton.Yes:
+        if is_danger:
+            btn_confirm.setStyleSheet(
+                "QPushButton { background: #dc2626; color: #ffffff; border: 1px solid #dc2626; "
+                "border-radius: 6px; padding: 7px 18px; min-width: 90px; font-weight: 600; font-size: 12px; }"
+                "QPushButton:hover { background: #b91c1c; border-color: #b91c1c; }"
+            )
+        else:
+            btn_confirm.setStyleSheet(
+                "QPushButton { background: #2563d9; color: #ffffff; border: 1px solid #2563d9; "
+                "border-radius: 6px; padding: 7px 18px; min-width: 90px; font-weight: 600; font-size: 12px; }"
+                "QPushButton:hover { background: #1d4ed8; border-color: #1d4ed8; }"
+            )
+        box.setDefaultButton(btn_confirm)
+        box.exec()
+        return box.clickedButton() == btn_confirm
+
+    def _restart_download(self):
+        confirmed = self._confirm_box(
+            "Tải lại từ đầu",
+            "Xác nhận tải lại từ đầu?",
+            "Thay thế dữ liệu <b>.part</b> và <b>checkpoint</b> hiện có?<br>Dữ liệu cũ sẽ không được dùng lại.",
+            confirm_text="Tải lại từ đầu",
+            cancel_text="Hủy bỏ",
+        )
+        if confirmed:
             self._start_download(resume=False, confirmed_reset=True)
 
     def _server_checked(self, name: str, status: str):
@@ -495,10 +550,16 @@ class MainWindow(QMainWindow):
                 self.resume_banner.show()
                 return
         if config.output.exists():
-            answer = QMessageBox.question(self, "Tệp đã tồn tại", f"Thay thế tệp hiện có?\n{config.output}",
-                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if answer != QMessageBox.StandardButton.Yes:
+            confirmed = self._confirm_box(
+                "Tệp đã tồn tại",
+                "Tệp đích đã tồn tại trên đĩa!",
+                f"Đường dẫn: <b>{config.output}</b><br><br>Bạn có muốn tải lại từ đầu và ghi đè lên tệp hiện có không?",
+                confirm_text="Tải lại (Ghi đè)",
+                cancel_text="Hủy bỏ",
+            )
+            if not confirmed:
                 return
+
         self._show_page(0)
         self._reset_session(config)
         self._controller = DownloadController()
@@ -654,8 +715,20 @@ class MainWindow(QMainWindow):
         self.progress_text.setText(advice)
         self.progress_text.setToolTip(str(error))
         if not self._close_after_work:
-            QMessageBox.warning(self, "Không thể hoàn tất tải",
-                                f"{advice}{part_note}\n\nChi tiết: {error}")
+            box = QMessageBox(self)
+            box.setWindowTitle("Không thể hoàn tất tải")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText("<h3>Không thể hoàn tất phiên tải</h3>")
+            box.setInformativeText(f"<p style='color: #334155; font-size: 13px;'>{advice}{part_note}</p><p style='color: #64748b; font-size: 11px;'>Chi tiết: {error}</p>")
+            btn_ok = box.addButton("Đã hiểu", QMessageBox.ButtonRole.AcceptRole)
+            box.setDefaultButton(btn_ok)
+            box.setStyleSheet(
+                "QDialog, QMessageBox { background-color: #ffffff; color: #0f172a; }"
+                "QLabel { color: #1e293b; background: transparent; font-size: 13px; }"
+                "QPushButton { background: #2563d9; color: #ffffff; border: 1px solid #2563d9; border-radius: 6px; padding: 7px 18px; min-width: 80px; font-weight: 600; }"
+                "QPushButton:hover { background: #1d4ed8; }"
+            )
+            box.exec()
 
     def _log(self, message: str):
         timestamp = time.strftime("%H:%M:%S")
@@ -671,12 +744,15 @@ class MainWindow(QMainWindow):
         if self._controller is None or not self._running:
             return
         if confirm:
-            answer = QMessageBox.question(
-                self, "Hủy phiên tải",
-                "Dừng tải? Tệp đang tải sẽ không được công bố; dữ liệu .part được giữ lại.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            confirmed = self._confirm_box(
+                "Hủy phiên tải",
+                "Bạn có chắc muốn dừng tải?",
+                "Dừng tải? Tệp đang tải sẽ không được công bố; dữ liệu <b>.part</b> được giữ lại để tiếp tục sau.",
+                confirm_text="Dừng tải",
+                cancel_text="Tải tiếp",
+                is_danger=True,
             )
-            if answer != QMessageBox.StandardButton.Yes:
+            if not confirmed:
                 return
         self.cancel_button.setEnabled(False)
         self.cancel_button.setText("Đang dừng…")
@@ -686,11 +762,15 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self._thread is not None and self._thread.isRunning():
             if not self._close_after_work:
-                answer = QMessageBox.question(
-                    self, "Đóng ứng dụng", "Dừng phiên tải và thoát?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                confirmed = self._confirm_box(
+                    "Đóng ứng dụng",
+                    "Đang có tiến trình hoạt động!",
+                    "Dừng phiên tải và thoát khỏi ứng dụng ngay?",
+                    confirm_text="Thoát",
+                    cancel_text="Không thoát",
+                    is_danger=True,
                 )
-                if answer != QMessageBox.StandardButton.Yes:
+                if not confirmed:
                     event.ignore()
                     return
             self._close_after_work = True
