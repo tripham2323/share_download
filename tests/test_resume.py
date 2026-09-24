@@ -41,7 +41,7 @@ class ResumeTests(unittest.TestCase):
         return ClientConfig((self.endpoint,), "config.dat", self.output,
                             chunk_size=16_384, connect_timeout=1, read_timeout=2)
 
-    def cancelled_session(self):
+    def cancelled_session(self, *, resume=True, save_checkpoint=False):
         controller = DownloadController()
         seen = []
         def on_event(event):
@@ -50,8 +50,8 @@ class ResumeTests(unittest.TestCase):
                 if len(seen) == 4:
                     controller.cancel()
         with self.assertRaises(DownloadCancelled):
-            download(self.config(), controller=controller, resume=True,
-                     event_callback=on_event)
+            download(self.config(), controller=controller, resume=resume,
+                     save_checkpoint=save_checkpoint, event_callback=on_event)
         self.assertFalse(self.output.exists())
         self.assertEqual(4, len(seen))
         state = self.root / "out.dat.part.state.json"
@@ -67,6 +67,15 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(self.data, result.output.read_bytes())
         self.assertEqual(28, len(self.server.requested))
         self.assertFalse((self.root / "out.dat.part.state.json").exists())
+
+    def test_fresh_checkpointed_session_can_resume_after_cancel(self):
+        self.cancelled_session(resume=False, save_checkpoint=True)
+        self.server.requested.clear()
+
+        result = download(self.config(), resume=True)
+
+        self.assertEqual(self.data, result.output.read_bytes())
+        self.assertEqual(28, len(self.server.requested))
 
     def test_corrupted_checkpoint_chunk_is_downloaded_again(self):
         self.cancelled_session()
@@ -92,8 +101,9 @@ class ResumeTests(unittest.TestCase):
         self.addCleanup(new_server.shutdown)
         self.endpoint = ServerEndpoint("S1", *new_server.address)
 
-        with self.assertRaises(ResumeConflict):
+        with self.assertRaises(ResumeConflict) as caught:
             download(self.config(), resume=True)
+        self.assertEqual("SIZE_MISMATCH", caught.exception.code)
 
         self.assertEqual(previous, part.read_bytes())
         self.assertFalse(self.output.exists())

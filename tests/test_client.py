@@ -16,6 +16,7 @@ from client import (
     download,
     load_config,
     parse_config,
+    query_metadata,
     select_consistent_servers,
 )
 from server import FileServer
@@ -46,6 +47,11 @@ class MetadataConsensusTests(unittest.TestCase):
             select_consistent_servers(
                 [(self.s1, self.a), (self.s2, self.b), (self.s3, self.c)]
             )
+
+    def test_ambiguous_metadata_has_stable_error_code(self):
+        with self.assertRaises(DownloadError) as caught:
+            select_consistent_servers([(self.s1, self.a), (self.s2, self.b)])
+        self.assertEqual("METADATA_CONFLICT", caught.exception.code)
 
     def test_one_server_is_usable(self):
         metadata, endpoints = select_consistent_servers([(self.s1, self.a)])
@@ -237,6 +243,22 @@ class ParallelDownloadTests(unittest.TestCase):
             sum(event.bytes_delta for event in events if event.kind == "chunk"),
         )
         self.assertEqual(self.source_bytes, result.output.read_bytes())
+
+    def test_distinguishes_unreachable_from_different_file(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed_port = probe.getsockname()[1]
+        endpoints = [
+            self.start_server("S1"),
+            ServerEndpoint("S2", "127.0.0.1", closed_port),
+        ]
+        events = []
+        result = download(self.config_for(endpoints), event_callback=events.append)
+        self.assertEqual(self.source_bytes, result.output.read_bytes())
+        self.assertTrue(any(event.kind == "server_unavailable" and event.server == "S2"
+                            for event in events))
+        self.assertFalse(any(event.kind == "server_excluded" and event.server == "S2"
+                             for event in events))
 
     def test_excludes_server_with_different_file(self):
         different = self.root / "different" / "config.dat"

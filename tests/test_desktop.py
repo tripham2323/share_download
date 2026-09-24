@@ -1,6 +1,8 @@
 import json
+import hashlib
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -8,6 +10,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from desktop.config_form import ConfigForm
+from checkpoint import CheckpointIdentity, CheckpointStore
+from file_utils import build_chunks
+from server import FileServer
 
 
 class DesktopConfigTests(unittest.TestCase):
@@ -55,6 +60,41 @@ class DesktopConfigTests(unittest.TestCase):
         window.config_form.add_server("S1", "127.0.0.1", 5001)
         self.assertTrue(window.start_button.isEnabled())
 
+
+    def test_checked_server_offers_verified_resume(self):
+        from desktop.window import MainWindow
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "config.dat"
+            source.write_bytes(bytes(range(256)) * 256)
+            output = root / "result.dat"
+            part = root / "result.dat.part"
+            part.write_bytes(source.read_bytes()[:16_384] + bytes(49_152))
+            chunks = build_chunks(65_536, 16_384)
+            identity = CheckpointIdentity("config.dat", 65_536,
+                                          hashlib.sha256(source.read_bytes()).hexdigest(), 16_384)
+            store = CheckpointStore(part, identity)
+            store.record(chunks[0], hashlib.sha256(source.read_bytes()[:16_384]).hexdigest())
+            with part.open("r+b") as target:
+                store.flush(target)
+            server = FileServer(source, "127.0.0.1", 0)
+            server.start()
+            self.addCleanup(server.shutdown)
+            window = MainWindow()
+            window.config_form.add_server("S1", *server.address)
+            window.config_form.chunk_size.setValue(16_384)
+            window.config_form.output_input.setText(str(output))
+            window.show()
+            self.addCleanup(window.close)
+            window._check_servers()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and window._running:
+                self.app.processEvents()
+                time.sleep(.01)
+            self.app.processEvents()
+            self.assertTrue(window.resume_button.isVisible())
+            self.assertEqual("25%", window.percent.text())
 
 
 if __name__ == "__main__":

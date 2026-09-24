@@ -3,18 +3,31 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 import threading
+from checkpoint import CheckpointIdentity, ResumeConflict, load_checkpoint, state_path_for
 from PySide6.QtCore import QObject, Signal, Slot
 
 from client import (
     ClientConfig, DownloadController, DownloadEvent, DownloadResult, download,
     query_metadata, select_consistent_servers,
 )
+from file_utils import build_chunks
+
+
+@dataclass(frozen=True, slots=True)
+class ResumePreview:
+    status: str
+    verified: int = 0
+    total: int = 0
+    reason: str = ""
+
 
 
 class MetadataWorker(QObject):
     status = Signal(str, str)
-    finished = Signal(str)
+    finished = Signal(str, object)
+    resume_state = Signal(object)
 
     def __init__(self, config: ClientConfig):
         super().__init__()
@@ -34,12 +47,38 @@ class MetadataWorker(QObject):
             for endpoint, _ in responses:
                 if endpoint not in selected:
                     self.status.emit(endpoint.name, "Khác phiên bản tệp")
+            part = self.config.output.with_name(self.config.output.name + ".part")
+            state = state_path_for(part)
+            if part.exists() or state.exists():
+                chunks = build_chunks(metadata.file_size, self.config.chunk_size)
+                identity = CheckpointIdentity(metadata.filename, metadata.file_size,
+                                              metadata.file_sha256, self.config.chunk_size)
+                try:
+                    verified = load_checkpoint(part, identity, chunks)
+                except ResumeConflict as exc:
+                    reason = {
+                        "MISSING_FILES": "Thiếu tệp .part hoặc checkpoint",
+                        "SIZE_MISMATCH": "Kích thước tệp .part không khớp metadata",
+                        "INVALID_JSON": "Checkpoint bị hỏng hoặc không đọc được",
+                        "UNSUPPORTED_VERSION": "Phiên bản checkpoint không được hỗ trợ",
+                        "IDENTITY_MISMATCH": "Tệp nguồn hoặc kích thước chunk đã thay đổi",
+                        "INVALID_CHUNKS": "Danh sách chunk trong checkpoint không hợp lệ",
+                        "INVALID_ENTRY": "Một chunk trong checkpoint không hợp lệ",
+                    }.get(exc.code, "Checkpoint không hợp lệ")
+                    self.resume_state.emit(ResumePreview("conflict", reason=reason))
+                else:
+                    self.resume_state.emit(ResumePreview("valid", len(verified), len(chunks)))
+            else:
+                self.resume_state.emit(ResumePreview("none"))
             self.finished.emit(
                 f"{len(selected)}/{len(self.config.servers)} máy chủ phù hợp · "
-                f"{metadata.file_size:,} byte · SHA-256 {metadata.file_sha256}"
+                f"{metadata.file_size:,} byte · SHA-256 {metadata.file_sha256}", None
             )
         except Exception as exc:
-            self.finished.emit(f"Không thể chọn nguồn tải: {exc}")
+            part = self.config.output.with_name(self.config.output.name + ".part")
+            if part.exists() or state_path_for(part).exists():
+                self.resume_state.emit(ResumePreview("unavailable", reason=str(exc)))
+            self.finished.emit(f"Không thể chọn nguồn tải: {exc}", exc)
 
 
 class DownloadWorker(QObject):
@@ -47,10 +86,12 @@ class DownloadWorker(QObject):
     finished = Signal(object)
     failed = Signal(object)
 
-    def __init__(self, config: ClientConfig, controller: DownloadController):
+    def __init__(self, config: ClientConfig, controller: DownloadController,
+                 resume: bool = False):
         super().__init__()
         self.config = config
         self.controller = controller
+        self.resume = resume
         self._lock = threading.Lock()
         self._latest: DownloadEvent | None = None
         self._bytes: dict[str, int] = defaultdict(int)
@@ -75,6 +116,7 @@ class DownloadWorker(QObject):
     def run(self) -> None:
         try:
             self.finished.emit(download(self.config, event_callback=self._event,
-                                        controller=self.controller))
+                                        controller=self.controller, resume=self.resume,
+                                        save_checkpoint=True))
         except Exception as exc:
             self.failed.emit(exc)

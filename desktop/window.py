@@ -3,21 +3,24 @@
 from __future__ import annotations
 
 from collections import deque
+import errno
 from pathlib import Path
 import time
 
 from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
+    QAbstractItemView, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
     QLabel, QListWidget, QMainWindow, QMessageBox, QProgressBar,
     QPushButton, QScrollArea, QStackedWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from client import ClientConfig, DownloadCancelled, DownloadController, DownloadEvent, DownloadResult
+from client import ClientConfig, DownloadCancelled, DownloadController, DownloadError, DownloadEvent, DownloadResult
+from checkpoint import ResumeConflict, state_path_for
 from desktop.config_form import ConfigForm
+from desktop.summary import SessionSummary
 from desktop.theme import STYLESHEET
-from desktop.worker import DownloadWorker, MetadataWorker
+from desktop.worker import DownloadWorker, MetadataWorker, ResumePreview
 
 
 def label(text: str, object_name: str = "") -> QLabel:
@@ -36,29 +39,52 @@ def card(layout_class=QVBoxLayout, name="card") -> tuple[QFrame, QVBoxLayout]:
     return frame, layout
 
 
+def error_advice(error: Exception) -> str:
+    if isinstance(error, ResumeConflict):
+        return "Checkpoint không khớp. Kiểm tra nguồn tệp hoặc chọn Tải lại từ đầu sau khi xem dữ liệu tạm."
+    code = error.code if isinstance(error, DownloadError) else (
+        "DISK_FULL" if isinstance(error, OSError) and error.errno == errno.ENOSPC else "DOWNLOAD_ERROR"
+    )
+    return {
+        "NO_METADATA": "Kiểm tra IP, port và trạng thái của các server rồi thử lại.",
+        "METADATA_CONFLICT": "Các server không cung cấp cùng phiên bản tệp. Đồng bộ tệp nguồn trước khi tải lại.",
+        "ALL_SERVERS_FAILED": "Tất cả server đã ngắt kết nối. Kiểm tra mạng rồi tiếp tục từ checkpoint.",
+        "HASH_MISMATCH": "SHA-256 toàn tệp không khớp. Kiểm tra tệp nguồn trên server trước khi tải lại.",
+        "DISK_FULL": "Ổ đĩa không đủ chỗ. Giải phóng dung lượng rồi tiếp tục.",
+    }.get(code, "Xem nhật ký và kiểm tra kết nối, quyền ghi thư mục đích trước khi thử lại.")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ShareDownload · Truyền tệp đa nguồn")
         self.resize(1280, 780)
-        self.setMinimumSize(870, 610)
+        self.setMinimumSize(760, 480)
         self.setStyleSheet(STYLESHEET)
         self.state = "idle"
         self._thread: QThread | None = None
         self._worker: DownloadWorker | MetadataWorker | None = None
         self._running = False
         self._close_after_work = False
+        self._active_part: Path | None = None
         self._controller: DownloadController | None = None
+        self._resume_preview: ResumePreview | None = None
         self._server_rows: dict[str, int] = {}
-        self._history: deque[tuple[float, dict[str, int]]] = deque()
+        self._rate_samples: deque[tuple[float, float]] = deque(maxlen=120)
         self._last_bytes: dict[str, int] = {}
         self._rate_time = time.monotonic()
+        self._session_started = 0.0
+        self._file_size = 0
+        self._verified_bytes = 0
+        self._server_count = 0
+        self._available_servers: set[str] = set()
+        self._failed_servers: set[str] = set()
         self._build()
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(200)
         self.poll_timer.timeout.connect(self._poll_progress)
         self.poll_timer.start()
-        self.config_form.changed.connect(self._validate)
+        self.config_form.changed.connect(self._on_config_changed)
         self._validate()
 
     def _build(self) -> None:
@@ -141,24 +167,28 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(30, 26, 30, 26)
         layout.setSpacing(16)
-        heading = QHBoxLayout()
-        heading_text = QVBoxLayout()
-        heading_text.addWidget(label("Phiên tải hiện tại", "pageTitle"))
-        heading_text.addWidget(label("Theo dõi tiến độ và chất lượng kết nối theo thời gian thực.", "muted"))
-        heading.addLayout(heading_text)
-        heading.addStretch()
+        heading = QVBoxLayout()
+        heading.setSpacing(10)
+        title = label("Phiên tải hiện tại", "pageTitle")
+        heading.addWidget(title)
+        subtitle = label("Theo dõi tiến độ và chất lượng kết nối theo thời gian thực.", "muted")
+        subtitle.setWordWrap(True)
+        heading.addWidget(subtitle)
+        actions = QHBoxLayout()
+        actions.addStretch()
         self.check_button = QPushButton("Kiểm tra máy chủ")
         self.check_button.clicked.connect(self._check_servers)
-        heading.addWidget(self.check_button)
+        actions.addWidget(self.check_button)
         self.start_button = QPushButton("Bắt đầu tải")
         self.start_button.setObjectName("primary")
-        self.start_button.clicked.connect(self._start_download)
-        heading.addWidget(self.start_button)
+        self.start_button.clicked.connect(lambda: self._start_download())
+        actions.addWidget(self.start_button)
         self.cancel_button = QPushButton("Hủy tải")
         self.cancel_button.setObjectName("danger")
         self.cancel_button.clicked.connect(self._cancel_download)
         self.cancel_button.setVisible(False)
-        heading.addWidget(self.cancel_button)
+        actions.addWidget(self.cancel_button)
+        heading.addLayout(actions)
         layout.addLayout(heading)
 
         hero, hero_layout = card(name="hero")
@@ -172,6 +202,7 @@ class MainWindow(QMainWindow):
         hero_layout.addLayout(file_line)
         self.path_label = label("Cấu hình máy chủ, tệp nguồn và nơi lưu trong mục bên trái.", "muted")
         self.path_label.setToolTip("")
+        self.path_label.setWordWrap(True)
         hero_layout.addWidget(self.path_label)
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
@@ -181,8 +212,29 @@ class MainWindow(QMainWindow):
         self.progress_text = label("—", "muted")
         hero_layout.addWidget(self.progress_text)
         layout.addWidget(hero)
+        self.resume_banner, resume_layout = card(name="hero")
+        self.resume_label = label("", "warning")
+        self.resume_label.setWordWrap(True)
+        resume_layout.addWidget(self.resume_label)
+        resume_actions = QHBoxLayout()
+        self.resume_button = QPushButton("Tiếp tục tải")
+        self.resume_button.setObjectName("primary")
+        self.resume_button.clicked.connect(lambda: self._start_download(resume=True))
+        self.restart_button = QPushButton("Tải lại từ đầu")
+        self.restart_button.clicked.connect(self._restart_download)
+        resume_actions.addWidget(self.resume_button)
+        resume_actions.addWidget(self.restart_button)
+        resume_actions.addStretch()
+        resume_layout.addLayout(resume_actions)
+        self.resume_banner.hide()
+        layout.addWidget(self.resume_banner)
+        self.summary = SessionSummary()
+        layout.addWidget(self.summary)
 
-        metrics = QHBoxLayout()
+        metrics = QGridLayout()
+        self._metrics_layout = metrics
+        self._metric_panels: list[QFrame] = []
+        self._metric_columns = 4
         self.speed_value = self._metric(metrics, "Tốc độ tổng", "—", "Theo dữ liệu thực")
         self.eta_value = self._metric(metrics, "Ước tính còn lại", "—", "Theo tốc độ gần đây")
         self.available_value = self._metric(metrics, "Máy chủ khả dụng", "—", "Máy chủ cùng phiên bản")
@@ -214,15 +266,27 @@ class MainWindow(QMainWindow):
         scroll.setWidget(page)
         return scroll
 
-    @staticmethod
-    def _metric(layout: QHBoxLayout, title: str, initial: str, caption: str) -> QLabel:
+    def _metric(self, layout: QGridLayout, title: str, initial: str, caption: str) -> QLabel:
         panel, stack = card(name="metric")
         stack.addWidget(label(title, "muted"))
         value = label(initial, "metricValue")
         stack.addWidget(value)
         stack.addWidget(label(caption, "caption"))
-        layout.addWidget(panel, 1)
+        layout.addWidget(panel, 0, len(self._metric_panels))
+        self._metric_panels.append(panel)
         return value
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not hasattr(self, "_metric_panels"):
+            return
+        columns = 2 if self.width() < 1000 else 4
+        if columns == self._metric_columns:
+            return
+        self._metric_columns = columns
+        for index, panel in enumerate(self._metric_panels):
+            self._metrics_layout.removeWidget(panel)
+            self._metrics_layout.addWidget(panel, index // columns, index % columns)
 
     def _show_page(self, index: int) -> None:
         self.pages.setCurrentIndex(index)
@@ -232,19 +296,30 @@ class MainWindow(QMainWindow):
             "Ứng dụng   /   " + ("Tổng quan phiên tải", "Cấu hình máy chủ", "Nhật ký phiên")[index]
         )
 
+    def _on_config_changed(self):
+        self._resume_preview = None
+        self.resume_banner.hide()
+        self._server_rows = {}
+        self._validate()
+
     def _validate(self) -> None:
         try:
             config = self.config_form.to_client_config()
         except ValueError:
             valid = False
+            if not self._running:
+                self.server_table.setRowCount(0)
+                self._server_rows = {}
         else:
             valid = True
             if not self._running:
                 self.file_title.setText(config.filename)
                 self.path_label.setText(str(config.output))
                 self.path_label.setToolTip(str(config.output))
-            self._populate_servers(config)
-        self.start_button.setEnabled(valid and not self._running)
+            if not self._server_rows:
+                self._populate_servers(config)
+        self.start_button.setEnabled(valid and not self._running
+                                     and self._resume_preview is None)
         self.check_button.setEnabled(valid and not self._running)
 
     def _populate_servers(self, config: ClientConfig) -> None:
@@ -285,6 +360,7 @@ class MainWindow(QMainWindow):
 
     def _launch(self, worker, done):
         self._running = True
+        self.config_form.setEnabled(False)
         self._validate()
         thread = QThread(self)
         worker.moveToThread(thread)
@@ -301,39 +377,122 @@ class MainWindow(QMainWindow):
         self._thread = None
         self._worker = None
         self._running = False
+        self.config_form.setEnabled(True)
+        self._controller = None
         self._validate()
         if self._close_after_work:
             self.close()
 
     def _check_servers(self):
+        if self._running:
+            return
         try:
             config = self.config_form.to_client_config()
         except ValueError:
             return
+        self._server_count = len(config.servers)
+        self._available_servers.clear()
+        self.available_value.setText(f"0 / {self._server_count}")
+        self.resume_banner.hide()
+        self._populate_servers(config)
+        self._resume_preview = None
         self.status_label.setText("ĐANG KIỂM TRA MÁY CHỦ")
         self._show_page(0)
         worker = MetadataWorker(config)
         def connect(w, thread):
             w.status.connect(self._server_checked)
+            w.resume_state.connect(self._resume_checked)
             w.finished.connect(self._metadata_done)
             w.finished.connect(thread.quit)
         self._launch(worker, connect)
+
+    def _resume_checked(self, preview: ResumePreview):
+        self._resume_preview = preview
+        if preview.status == "valid":
+            self.show_resume_banner(preview.verified, preview.total)
+        elif preview.status == "conflict":
+            self.show_resume_conflict(preview.reason)
+        elif preview.status == "unavailable":
+            self.resume_label.setText(
+                "Chưa thể kiểm tra dữ liệu tạm vì không chọn được server. "
+                "Kiểm tra kết nối rồi thử lại; dữ liệu .part được giữ nguyên."
+            )
+            self.resume_button.setVisible(False)
+            self.restart_button.setVisible(False)
+            self.resume_banner.show()
+        else:
+            self.resume_banner.hide()
+        self._validate()
+
+    def show_resume_banner(self, verified_chunks: int, total_chunks: int):
+        percent = 100 * verified_chunks / total_chunks if total_chunks else 100
+        self.resume_label.setText(
+            f"Có phiên tải trước: {verified_chunks:,}/{total_chunks:,} chunk đã xác minh "
+            f"({percent:.0f}%). Có thể tiếp tục mà không tải lại các chunk này."
+        )
+        self.restart_button.setVisible(True)
+        self.resume_button.setVisible(True)
+        self.resume_banner.show()
+        self.progress.setValue(round(percent * 10))
+        self.percent.setText(f"{percent:.0f}%")
+        self.progress_text.setText(f"{verified_chunks:,} / {total_chunks:,} chunk đã kiểm tra trên đĩa")
+
+    def show_resume_conflict(self, reason: str):
+        self.resume_label.setText(
+            f"Không thể tiếp tục an toàn: {reason}. "
+            "Giữ dữ liệu cũ hoặc xác nhận tải lại từ đầu."
+        )
+        self.resume_button.setVisible(False)
+        self.progress.setValue(0)
+        self.percent.setText("—")
+        self.progress_text.setText("Dữ liệu tạm chưa được xác minh")
+        self.restart_button.setVisible(True)
+        self.resume_banner.show()
+
+    def _restart_download(self):
+        answer = QMessageBox.question(
+            self, "Tải lại từ đầu",
+            "Thay thế dữ liệu .part và checkpoint hiện có? Dữ liệu cũ sẽ không được dùng lại.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._start_download(resume=False, confirmed_reset=True)
 
     def _server_checked(self, name: str, status: str):
         row = self._server_rows.get(name)
         if row is not None:
             self._set_cell(row, 1, status)
+        if status == "Đã kết nối":
+            self._available_servers.add(name)
+        else:
+            self._available_servers.discard(name)
+        self.available_value.setText(f"{len(self._available_servers)} / {self._server_count}")
         self._log(f"{name}: {status}")
 
-    def _metadata_done(self, message: str):
-        self.status_label.setText("KIỂM TRA HOÀN TẤT")
+    def _metadata_done(self, message: str, error: Exception | None):
+        self.status_label.setText("KHÔNG THỂ CHỌN NGUỒN TẢI" if error else "KIỂM TRA HOÀN TẤT")
+        if error:
+            self.progress_text.setText(error_advice(error))
+            self.progress_text.setToolTip(str(error))
         self._log(message)
 
-    def _start_download(self):
+    def _start_download(self, *, resume: bool = False, confirmed_reset: bool = False):
+        if self._running:
+            return
         try:
             config = self.config_form.to_client_config()
         except ValueError:
             return
+        part = config.output.with_name(config.output.name + ".part")
+        if part.exists() or state_path_for(part).exists():
+            if self._resume_preview is None:
+                self._check_servers()
+                return
+            if resume and self._resume_preview.status != "valid":
+                return
+            if not resume and not confirmed_reset:
+                self.resume_banner.show()
+                return
         if config.output.exists():
             answer = QMessageBox.question(self, "Tệp đã tồn tại", f"Thay thế tệp hiện có?\n{config.output}",
                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
@@ -342,7 +501,7 @@ class MainWindow(QMainWindow):
         self._show_page(0)
         self._reset_session(config)
         self._controller = DownloadController()
-        worker = DownloadWorker(config, self._controller)
+        worker = DownloadWorker(config, self._controller, resume=resume)
         def connect(w, thread):
             w.status.connect(self._download_event)
             w.finished.connect(self._download_finished)
@@ -352,6 +511,7 @@ class MainWindow(QMainWindow):
         self._launch(worker, connect)
 
     def _reset_session(self, config: ClientConfig):
+        self._active_part = config.output.with_name(config.output.name + ".part")
         self.state = "downloading"
         self.status_label.setText("ĐANG KẾT NỐI")
         self.progress.setValue(0)
@@ -361,18 +521,34 @@ class MainWindow(QMainWindow):
         self.available_value.setText("—")
         self.integrity_value.setText("Chờ xác minh")
         self.progress_text.setText("Đang lấy metadata…")
-        self._history.clear()
+        self._rate_samples.clear()
         self._rate_time = time.monotonic()
         self._last_bytes = {}
+        self._session_started = self._rate_time
+        self._file_size = 0
+        self._verified_bytes = 0
+        self._server_count = len(config.servers)
+        self._failed_servers.clear()
+        self._available_servers.clear()
+        self.available_value.setText(f"0 / {self._server_count}")
+        self.summary.hide()
         self.activity_list.clear()
         self.cancel_button.setVisible(True)
         self.cancel_button.setEnabled(True)
+        self.cancel_button.setText("Hủy tải")
+        self.resume_banner.hide()
         self._populate_servers(config)
 
     def _download_event(self, event: DownloadEvent):
         if event.kind == "metadata":
+            self._file_size = event.file_size
+            self._verified_bytes = event.verified_bytes
             self.status_label.setText("ĐANG TẢI")
-            self.progress_text.setText(f"0 / {event.total_chunks} chunk")
+            self.progress.setValue(round(event.completed_chunks * 1000 / event.total_chunks)
+                                   if event.total_chunks else 1000)
+            self.percent.setText(f"{event.completed_chunks * 100 / event.total_chunks:.0f}%"
+                                 if event.total_chunks else "100%")
+            self.progress_text.setText(f"{event.completed_chunks:,} / {event.total_chunks:,} chunk")
             self._log("Đã đối chiếu metadata · " + event.message)
         elif event.kind == "verifying":
             self._poll_progress()
@@ -380,13 +556,22 @@ class MainWindow(QMainWindow):
             self.status_label.setText("ĐANG XÁC MINH SHA-256")
             self.integrity_value.setText("Đang xác minh")
             self._log("Đã tải đủ chunk, đang xác minh SHA-256 toàn tệp")
-        elif event.kind in {"server_connected", "server_failed", "server_excluded", "chunk_requeued"}:
+        elif event.kind in {"server_connected", "server_failed", "server_excluded",
+                            "server_unavailable", "chunk_requeued"}:
             name = event.server or "Server"
             row = self._server_rows.get(name)
             texts = {"server_connected": "Đang truyền", "server_failed": "Mất kết nối",
-                     "server_excluded": "Không cùng phiên bản", "chunk_requeued": "Đang chuyển chunk"}
+                     "server_excluded": "Không cùng phiên bản",
+                     "server_unavailable": "Không phản hồi", "chunk_requeued": "Đang chuyển chunk"}
             if row is not None:
                 self._set_cell(row, 1, texts[event.kind])
+            if event.kind == "server_connected":
+                self._available_servers.add(name)
+            elif event.kind in {"server_failed", "server_excluded", "server_unavailable"}:
+                self._available_servers.discard(name)
+                if event.kind == "server_failed":
+                    self._failed_servers.add(name)
+            self.available_value.setText(f"{len(self._available_servers)} / {self._server_count}")
             self._log(f"{name}: {texts[event.kind]}" + (f" · {event.message}" if event.message else ""))
         elif event.kind == "completed":
             self._poll_progress()
@@ -401,24 +586,30 @@ class MainWindow(QMainWindow):
             completed = latest.completed_chunks
             self.progress.setValue(round(completed * 1000 / total) if total else 1000)
             self.percent.setText(f"{completed * 100 / total:.0f}%" if total else "100%")
-            self.progress_text.setText(f"{completed:,} / {total:,} chunk · {sum(bytes_by_server.values()):,} byte đã tải")
+            self.progress_text.setText(
+                f"{completed:,} / {total:,} chunk · "
+                f"{self._verified_bytes + sum(bytes_by_server.values()):,} / {self._file_size:,} byte"
+            )
             for name, amount in bytes_by_server.items():
                 row = self._server_rows.get(name)
                 if row is not None:
-                    self._set_cell(row, 2, f"{chunks_by_server.get(name, 0):,} chunk")
+                    self._set_cell(row, 2, f"{amount:,} B · {chunks_by_server.get(name, 0):,} chunk")
         now = time.monotonic()
         if not bytes_by_server or now - self._rate_time < 1:
             return
-        self._history.append((now, bytes_by_server))
-        while self._history and now - self._history[0][0] > 5:
-            self._history.popleft()
         elapsed = max(now - self._rate_time, .001)
         rates = {name: max(0, amount - self._last_bytes.get(name, 0)) / elapsed
                  for name, amount in bytes_by_server.items()}
         self._last_bytes = bytes_by_server
         self._rate_time = now
         total_rate = sum(rates.values())
+        self._rate_samples.append((now - self._session_started, total_rate))
         self.speed_value.setText(f"{total_rate / 1_048_576:.1f} MB/s")
+        if total_rate > 0 and self.state == "downloading":
+            remaining = max(0, self._file_size - self._verified_bytes - sum(bytes_by_server.values()))
+            self.eta_value.setText(f"{remaining / total_rate:.0f} giây")
+        elif self.state == "downloading":
+            self.eta_value.setText("—")
         for name, rate in rates.items():
             row = self._server_rows.get(name)
             if row is not None:
@@ -429,9 +620,15 @@ class MainWindow(QMainWindow):
         self.state = "completed"
         self.status_label.setText("TẢI HOÀN TẤT · SHA-256 HỢP LỆ")
         self.integrity_value.setText("Đã xác minh")
-        self.percent.setText("100%")
         self.progress.setValue(1000)
         self.progress_text.setText(f"{result.bytes_written:,} byte · SHA-256: {result.file_sha256}")
+        self.eta_value.setText("0 giây")
+        self.summary.set_result(result, time.monotonic() - self._session_started,
+                                list(self._rate_samples), self._failed_servers)
+        for name, count in result.per_server_chunks.items():
+            row = self._server_rows.get(name)
+            if row is not None:
+                self._set_cell(row, 2, f"{result.per_server_bytes.get(name, 0):,} B · {count:,} chunk")
         self.progress_text.setToolTip(result.file_sha256)
         self.cancel_button.setVisible(False)
         self._log(f"Đã lưu: {result.output} · SHA-256 {result.file_sha256}")
@@ -448,8 +645,16 @@ class MainWindow(QMainWindow):
         self.status_label.setText("TẢI THẤT BẠI")
         self.integrity_value.setText("Chưa xác minh")
         self._log(f"Lỗi: {error}")
+        advice = error_advice(error)
+        part_note = (
+            f"\n\nDữ liệu tạm: {self._active_part}"
+            if self._active_part is not None and self._active_part.exists() else ""
+        )
+        self.progress_text.setText(advice)
+        self.progress_text.setToolTip(str(error))
         if not self._close_after_work:
-            QMessageBox.warning(self, "Không thể hoàn tất tải", str(error))
+            QMessageBox.warning(self, "Không thể hoàn tất tải",
+                                f"{advice}{part_note}\n\nChi tiết: {error}")
 
     def _log(self, message: str):
         timestamp = time.strftime("%H:%M:%S")

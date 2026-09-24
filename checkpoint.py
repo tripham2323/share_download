@@ -15,6 +15,10 @@ from scheduler import Chunk
 class ResumeConflict(ValueError):
     """Saved data cannot be matched safely to the current source."""
 
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
+
 
 @dataclass(frozen=True, slots=True)
 class CheckpointIdentity:
@@ -34,22 +38,24 @@ def load_checkpoint(part_path: Path, identity: CheckpointIdentity,
     if not part_path.exists() and not state_path.exists():
         return {}
     if not part_path.is_file() or not state_path.is_file():
-        raise ResumeConflict("Missing partial file or checkpoint; keep the old data or start over")
+        raise ResumeConflict("Missing partial file or checkpoint; keep the old data or start over",
+                             code="MISSING_FILES")
     if part_path.stat().st_size != identity.file_size:
-        raise ResumeConflict("Partial file size differs from server metadata")
+        raise ResumeConflict("Partial file size differs from server metadata", code="SIZE_MISMATCH")
     try:
         raw = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ResumeConflict("Checkpoint cannot be read or is not valid JSON") from exc
+        raise ResumeConflict("Checkpoint cannot be read or is not valid JSON",
+                             code="INVALID_JSON") from exc
     if not isinstance(raw, dict) or raw.get("version") != 1:
-        raise ResumeConflict("Unsupported checkpoint version")
+        raise ResumeConflict("Unsupported checkpoint version", code="UNSUPPORTED_VERSION")
     expected = {"filename": identity.filename, "file_size": identity.file_size,
                 "file_sha256": identity.file_sha256, "chunk_size": identity.chunk_size}
     if any(raw.get(field) != value for field, value in expected.items()):
-        raise ResumeConflict("Server file version or chunk size changed")
+        raise ResumeConflict("Server file version or chunk size changed", code="IDENTITY_MISMATCH")
     saved = raw.get("completed")
     if not isinstance(saved, dict):
-        raise ResumeConflict("Checkpoint chunk list is invalid")
+        raise ResumeConflict("Checkpoint chunk list is invalid", code="INVALID_CHUNKS")
     by_id = {chunk.chunk_id: chunk for chunk in chunks}
     verified = {}
     with part_path.open("rb") as target:
@@ -57,7 +63,7 @@ def load_checkpoint(part_path: Path, identity: CheckpointIdentity,
             if (not isinstance(chunk_id, str) or not chunk_id.isdecimal()
                     or int(chunk_id) not in by_id or not isinstance(digest, str)
                     or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)):
-                raise ResumeConflict("Checkpoint contains an invalid chunk entry")
+                raise ResumeConflict("Checkpoint contains an invalid chunk entry", code="INVALID_ENTRY")
             chunk = by_id[int(chunk_id)]
             target.seek(chunk.offset)
             data = target.read(chunk.length)

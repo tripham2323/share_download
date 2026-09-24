@@ -15,7 +15,7 @@ QLabel#formTitle { font-size: 20px; font-weight: 700; }
 QLabel#fileTitle { font-size: 19px; font-weight: 700; }
 QLabel#metricValue { font-size: 20px; font-weight: 700; color: #172439; }
 QLabel#percent { font-size: 30px; font-weight: 700; color: #174db7; }
-QLabel#muted, QLabel#caption { color: #62748b; }
+QLabel#muted, QLabel#caption { color: #5f7085; }
 QLabel#formError { color: #b02f39; font-weight: 600; }
 QLabel#state { color: #174db7; font-weight: 700; }
 QLabel#warning { color: #8c5711; font-weight: 600; }
@@ -26,7 +26,7 @@ QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 2px solid #2563d
 QPushButton { background: white; border: 1px solid #d4dfea; border-radius: 7px; padding: 9px 14px; font-weight: 600; }
 QPushButton:hover { background: #edf4ff; border-color: #9cb9eb; }
 QPushButton:focus { border: 2px solid #2563d9; }
-QPushButton:disabled { color: #73839a; background: #edf0f4; }
+QPushButton:disabled { color: #596b81; background: #edf0f4; }
 QPushButton#primary { background: #2563d9; color: #ffffff; border-color: #2563d9; }
 QPushButton#primary:hover { background: #174db7; }
 QPushButton#danger { color: #a7353f; border-color: #dcb7bd; }

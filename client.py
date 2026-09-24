@@ -29,6 +29,10 @@ from scheduler import Chunk, ChunkScheduler
 class DownloadError(Exception):
     """Raised when a download cannot safely continue."""
 
+    def __init__(self, message: str, *, code: str = "DOWNLOAD_ERROR"):
+        super().__init__(message)
+        self.code = code
+
 class DownloadCancelled(DownloadError):
     """The user stopped the session before publication."""
 
@@ -116,6 +120,8 @@ class DownloadEvent:
     completed_chunks: int = 0
     total_chunks: int = 0
     bytes_delta: int = 0
+    file_size: int = 0
+    verified_bytes: int = 0
     message: str = ""
 
 
@@ -258,7 +264,7 @@ def select_consistent_servers(
     results: list[tuple[ServerEndpoint, FileMetadata]],
 ) -> tuple[FileMetadata, list[ServerEndpoint]]:
     if not results:
-        raise DownloadError("no valid metadata responses")
+        raise DownloadError("no valid metadata responses", code="NO_METADATA")
 
     groups: dict[FileMetadata, list[ServerEndpoint]] = defaultdict(list)
     for endpoint, metadata in results:
@@ -268,7 +274,8 @@ def select_consistent_servers(
     metadata, endpoints = ranked[0]
     if len(results) == 1 or len(endpoints) > len(results) / 2:
         return metadata, endpoints
-    raise DownloadError("no metadata majority among responding servers")
+    raise DownloadError("no metadata majority among responding servers",
+                        code="METADATA_CONFLICT")
 
 
 def download(
@@ -278,6 +285,7 @@ def download(
     event_callback: Callable[[DownloadEvent], None] | None = None,
     controller: DownloadController | None = None,
     resume: bool = False,
+    save_checkpoint: bool = False,
 ) -> DownloadResult:
     event_lock = threading.Lock()
 
@@ -304,13 +312,18 @@ def download(
         prepare_part_file(config.output, metadata.file_size)
         verified = {}
     scheduler = ChunkScheduler(chunks, completed_ids=frozenset(verified))
-    checkpoint = CheckpointStore(part_path, identity, verified) if resume else None
+    checkpoint = CheckpointStore(part_path, identity, verified) if resume or save_checkpoint else None
     emit(DownloadEvent("metadata", completed_chunks=len(verified), total_chunks=len(chunks),
+                       file_size=metadata.file_size,
+                       verified_bytes=sum(chunks[chunk_id].length for chunk_id in verified),
                        message=f"{metadata.file_size} bytes; SHA-256 {metadata.file_sha256}"))
+    responded = {endpoint for endpoint, _ in metadata_results}
     for endpoint in config.servers:
         if endpoint not in endpoints:
-            emit(DownloadEvent("server_excluded", server=endpoint.name,
-                               message="Unavailable or different file version"))
+            unavailable = endpoint not in responded
+            emit(DownloadEvent("server_unavailable" if unavailable else "server_excluded",
+                               server=endpoint.name,
+                               message="No metadata response" if unavailable else "Different file version"))
     control.check()
     stats = {endpoint.name: _WorkerStats() for endpoint in endpoints}
 
@@ -348,10 +361,13 @@ def download(
                 checkpoint.flush(target)
 
         if worker_errors:
-            raise DownloadError(f"unable to write downloaded chunk: {worker_errors[0]}") from worker_errors[0]
+            error = worker_errors[0]
+            code = "DISK_FULL" if isinstance(error, OSError) and error.errno == 28 else "DOWNLOAD_ERROR"
+            raise DownloadError(f"unable to write downloaded chunk: {error}", code=code) from error
         control.check()
         if scheduler.has_unfinished():
-            raise DownloadError("all usable servers failed before download completed")
+            raise DownloadError("all usable servers failed before download completed",
+                                code="ALL_SERVERS_FAILED")
 
     control.check()
     emit(DownloadEvent("verifying", completed_chunks=scheduler.completed_count(),
@@ -359,7 +375,8 @@ def download(
     actual_sha256 = sha256_file(part_path)
     if actual_sha256 != metadata.file_sha256:
         raise DownloadError(
-            "downloaded file SHA-256 does not match server metadata"
+            "downloaded file SHA-256 does not match server metadata",
+            code="HASH_MISMATCH",
         )
     control.publish(part_path, config.output)
     if checkpoint is not None:
