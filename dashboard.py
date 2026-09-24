@@ -63,6 +63,11 @@ class VisualDashboard:
         self.completed_count = 0
         self.is_finished = False
 
+        # Clear screen once at beginning
+        if sys.stdout.isatty():
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+
     def setup_metadata(self, filename: str, file_size: int, total_chunks: int, server_names: List[str]):
         with self._lock:
             self.filename = filename
@@ -244,13 +249,13 @@ class VisualDashboard:
             lines.append(f" {self.BOLD}DATA INTEGRITY (SHA-256):{self.RESET} {self.sha256_status}")
             lines.append("=" * 72)
 
-            output = "\n".join(lines)
-
             if sys.stdout.isatty():
-                # Move cursor to top without flicker
+                # Move cursor to top without flicker, clear each line to right and clear screen downwards
+                output = "\n".join(line + "\033[K" for line in lines) + "\n\033[J"
                 sys.stdout.write("\033[H" + output)
                 sys.stdout.flush()
             else:
+                output = "\n".join(lines)
                 # Fallback for non-interactive output (in milestone snapshots)
                 should_print = force or self.is_finished
                 if not should_print and self.total_chunks > 0:

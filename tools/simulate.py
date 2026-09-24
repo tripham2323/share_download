@@ -88,7 +88,10 @@ def run_visual_demo(failover: bool = False, loss: float = 0.0):
     router = NetworkRouter(routes)
     router.start()
 
-    time.sleep(0.5)
+    time.sleep(1.0)
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
 
     # Cấu hình Client kết nối qua các kênh Router
     config = ClientConfig(
@@ -134,7 +137,14 @@ def run_visual_demo(failover: bool = False, loss: float = 0.0):
         t_fail.start()
 
     def _on_event(ev):
-        if ev.kind == "chunk_start" and ev.chunk_id is not None and ev.server:
+        if ev.kind == "metadata":
+            dash.setup_metadata(
+                filename="config.dat",
+                file_size=ev.file_size,
+                total_chunks=ev.total_chunks,
+                server_names=["S1", "S2", "S3"],
+            )
+        elif ev.kind == "chunk_start" and ev.chunk_id is not None and ev.server:
             dash.on_chunk_start(ev.server, ev.chunk_id)
         elif ev.kind == "chunk" and ev.server:
             dash.on_chunk_complete(ev.server, ev.chunk_id if ev.chunk_id is not None else -1, ev.bytes_delta)
