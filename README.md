@@ -11,7 +11,7 @@ Chương trình tải đồng thời một tệp từ nhiều máy chủ bằng 
 - Tiếp tục tải bằng các server còn lại khi một server ngắt kết nối.
 - Phát hiện server chứa phiên bản file khác.
 - Chạy được trên localhost, VMware và nhiều máy thật.
-- Chỉ sử dụng Python standard library, không cần cài package ngoài.
+- CLI và giao thức TCP chỉ dùng Python standard library; giao diện desktop dùng PySide6 cài riêng.
 
 ## Yêu cầu
 
@@ -57,23 +57,61 @@ Mỗi thông điệp TCP gồm:
 ```text
 share_download/
 ├── client.py
+├── desktop_app.py
+├── desktop/
+│   ├── config_form.py
+│   ├── window.py
+│   └── summary.py
+├── checkpoint.py
 ├── server.py
 ├── protocol.py
 ├── scheduler.py
 ├── file_utils.py
+├── requirements-desktop.txt
 ├── client_config.example.json
 ├── docs/
 │   └── superpowers/
 │       ├── specs/
 │       └── plans/
 └── tests/
-```
 
 - `server.py`: phục vụ metadata và vùng byte của file.
 - `client.py`: tải đồng thời, lập lịch chunk, kiểm tra hash và giao diện CLI.
 - `protocol.py`: đóng khung thông điệp TCP.
 - `scheduler.py`: quản lý trạng thái và hàng đợi chunk.
 - `file_utils.py`: chia chunk, tính SHA-256 và quản lý file tạm.
+- `desktop_app.py`: mở giao diện Qt; `desktop/`: cấu hình, giám sát và báo cáo phiên.
+- `checkpoint.py`: ghi checkpoint theo chunk vào `<output>.part.state.json` để tiếp tục an toàn.
+
+## Giao diện desktop trên C1
+
+CLI vẫn chạy độc lập, không cần cài Qt. Trên Windows PowerShell, cài riêng giao diện:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-desktop.txt
+python desktop_app.py
+```
+
+Trên Linux/macOS, dùng `source .venv/bin/activate` thay lệnh kích hoạt PowerShell.
+Ứng dụng nạp `client_config.json` nếu có, nếu không nạp `client_config.example.json`.
+Vào **Cấu hình máy chủ** để sửa tên/IP/port, tên tệp, nơi lưu và tùy chọn nâng cao; lưu JSON qua **Lưu cấu hình…**.
+Đường dẫn `output` tương đối được tính từ thư mục chứa file cấu hình.
+Trên **Tổng quan phiên tải**, chọn **Kiểm tra máy chủ** rồi **Bắt đầu tải**.
+Giao diện truy vấn metadata và tải ngoài luồng UI, thể hiện tốc độ, byte/chunk từng nguồn, tiến độ, ETA,
+log chuyển chunk và kết quả SHA-256. **Báo cáo phiên tải** có nút sao chép hash và mở thư mục kết quả;
+biểu đồ chỉ vẽ khi có ít nhất hai mẫu tốc độ thật.
+
+**Hủy tải** giữ dữ liệu đã xác minh trong `<output>.part` và checkpoint
+`<output>.part.state.json`; chưa tạo file đầu ra khi chưa xác minh SHA-256 toàn tệp.
+Mở lại ứng dụng sẽ lấy metadata mới, đối chiếu checkpoint và hash lại từng chunk trên đĩa trước khi hiện
+**Tiếp tục tải**. Chunk sai được tải lại; chunk đúng không cần yêu cầu qua mạng.
+Nếu metadata, kích thước chunk hoặc dữ liệu tạm không khớp, ứng dụng giữ nguyên dữ liệu cũ;
+chỉ **Tải lại từ đầu** sau xác nhận mới thay thế dữ liệu `.part`.
+Nếu file đích đã tồn tại, ứng dụng hỏi trước khi ghi đè. CLI mặc định vẫn tải mới như trước;
+chế độ khôi phục này chỉ được bật từ giao diện.
+
 
 # Chạy trên một máy
 

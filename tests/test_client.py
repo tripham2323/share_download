@@ -1,17 +1,21 @@
 import hashlib
 import json
 import socket
+import threading
 import tempfile
 import unittest
 from pathlib import Path
 
 from client import (
     ClientConfig,
+    DownloadCancelled,
+    DownloadController,
     DownloadError,
     FileMetadata,
     ServerEndpoint,
     download,
     load_config,
+    parse_config,
     query_metadata,
     select_consistent_servers,
 )
@@ -43,6 +47,11 @@ class MetadataConsensusTests(unittest.TestCase):
             select_consistent_servers(
                 [(self.s1, self.a), (self.s2, self.b), (self.s3, self.c)]
             )
+
+    def test_ambiguous_metadata_has_stable_error_code(self):
+        with self.assertRaises(DownloadError) as caught:
+            select_consistent_servers([(self.s1, self.a), (self.s2, self.b)])
+        self.assertEqual("METADATA_CONFLICT", caught.exception.code)
 
     def test_one_server_is_usable(self):
         metadata, endpoints = select_consistent_servers([(self.s1, self.a)])
@@ -80,6 +89,12 @@ class ClientConfigTests(unittest.TestCase):
             self.assertEqual(2, len(config.servers))
             self.assertEqual(Path(directory, "downloads", "config.dat"), config.output)
             self.assertEqual(262144, config.chunk_size)
+
+    def test_parses_in_memory_form_like_saved_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(directory)
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(load_config(path), parse_config(raw, path.parent))
 
     def test_rejects_duplicate_server_names(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -139,6 +154,34 @@ class DisconnectOnChunkServer(FileServer):
         client.close()
 
 
+class StallSecondChunkServer(FileServer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.blocked = threading.Event()
+        self.release = threading.Event()
+
+    def _send_chunk(self, client, header):
+        if header["chunk_id"] == 1:
+            self.blocked.set()
+            self.release.wait(timeout=10)
+            return
+        super()._send_chunk(client, header)
+
+
+class StallMetadataServer(FileServer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.blocked = threading.Event()
+        self.release = threading.Event()
+
+    def _dispatch(self, client, header):
+        if header["type"] == "FILE_INFO_REQUEST":
+            self.blocked.set()
+            self.release.wait(timeout=5)
+            return
+        super()._dispatch(client, header)
+
+
 class ParallelDownloadTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -185,6 +228,38 @@ class ParallelDownloadTests(unittest.TestCase):
         self.assertEqual(len(self.source_bytes), sum(result.per_server_bytes.values()))
         self.assertTrue(all(speed >= 0 for speed in result.per_server_kbps.values()))
 
+    def test_emits_structured_events(self):
+        endpoints = [self.start_server("S1"), self.start_server("S2")]
+        events = []
+
+        result = download(self.config_for(endpoints), event_callback=events.append)
+
+        kinds = [event.kind for event in events]
+        self.assertLess(kinds.index("metadata"), kinds.index("chunk"))
+        self.assertLess(kinds.index("chunk"), kinds.index("verifying"))
+        self.assertLess(kinds.index("verifying"), kinds.index("completed"))
+        self.assertEqual(
+            len(self.source_bytes),
+            sum(event.bytes_delta for event in events if event.kind == "chunk"),
+        )
+        self.assertEqual(self.source_bytes, result.output.read_bytes())
+
+    def test_distinguishes_unreachable_from_different_file(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed_port = probe.getsockname()[1]
+        endpoints = [
+            self.start_server("S1"),
+            ServerEndpoint("S2", "127.0.0.1", closed_port),
+        ]
+        events = []
+        result = download(self.config_for(endpoints), event_callback=events.append)
+        self.assertEqual(self.source_bytes, result.output.read_bytes())
+        self.assertTrue(any(event.kind == "server_unavailable" and event.server == "S2"
+                            for event in events))
+        self.assertFalse(any(event.kind == "server_excluded" and event.server == "S2"
+                             for event in events))
+
     def test_excludes_server_with_different_file(self):
         different = self.root / "different" / "config.dat"
         different.parent.mkdir()
@@ -212,6 +287,91 @@ class ParallelDownloadTests(unittest.TestCase):
 
         self.assertEqual(self.source_bytes, result.output.read_bytes())
         self.assertEqual(0, result.per_server_chunks["S3"])
+    def test_reports_failed_server_after_reassignment(self):
+        endpoints = [
+            self.start_server("S1"),
+            self.start_server("S2"),
+            self.start_server("S3", server_type=DisconnectOnChunkServer),
+        ]
+        events = []
+
+        result = download(self.config_for(endpoints), event_callback=events.append)
+
+        self.assertEqual(self.source_bytes, result.output.read_bytes())
+        self.assertTrue(any(event.kind == "chunk_requeued" and event.server == "S3"
+                            for event in events))
+        self.assertTrue(any(event.kind == "server_failed" and event.server == "S3"
+                            for event in events))
+
+
+
+    def test_cancel_during_blocked_read(self):
+        server = StallSecondChunkServer(self.source, "127.0.0.1", 0, read_timeout=2)
+        server.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.release.set)
+        endpoint = ServerEndpoint("S1", *server.address)
+        controller = DownloadController()
+        outcome = {}
+
+        def run():
+            try:
+                download(self.config_for([endpoint]), controller=controller)
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(server.blocked.wait(timeout=3))
+        controller.cancel()
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertIsInstance(outcome.get("error"), DownloadCancelled)
+        self.assertFalse((self.root / "downloaded.dat").exists())
+        self.assertTrue((self.root / "downloaded.dat.part").exists())
+
+
+    def test_cancel_during_verification_does_not_publish(self):
+        endpoint = self.start_server("S1")
+        controller = DownloadController()
+
+        def cancel_on_verifying(event):
+            if event.kind == "verifying":
+                controller.cancel()
+
+        with self.assertRaises(DownloadCancelled):
+            download(self.config_for([endpoint]), controller=controller,
+                     event_callback=cancel_on_verifying)
+        self.assertFalse((self.root / "downloaded.dat").exists())
+
+
+    def test_cancel_while_metadata_waits_on_socket(self):
+        server = StallMetadataServer(self.source, "127.0.0.1", 0, read_timeout=5)
+        server.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.release.set)
+        endpoint = ServerEndpoint("S1", *server.address)
+        config = self.config_for([endpoint])
+        controller = DownloadController()
+        outcome = {}
+
+        def run():
+            try:
+                download(config, controller=controller)
+            except BaseException as exc:
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            self.assertTrue(server.blocked.wait(timeout=2))
+            controller.cancel()
+            thread.join(timeout=0.7)
+            self.assertFalse(thread.is_alive(), "cancel must interrupt metadata socket")
+            self.assertIsInstance(outcome.get("error"), DownloadCancelled)
+        finally:
+            server.release.set()
+            thread.join(timeout=3)
 
 
 if __name__ == "__main__":
