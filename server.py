@@ -1,4 +1,4 @@
-"""TCP server that exposes metadata and byte ranges for one configured file."""
+"""TCP server exposing metadata and byte ranges for an immutable catalogue or CLI file."""
 
 from __future__ import annotations
 
@@ -6,9 +6,11 @@ import argparse
 from hashlib import sha256
 from pathlib import Path
 import socket
+import sqlite3
 import threading
 from typing import Any
 
+from file_store import FileStore, StoredFile
 from file_utils import sha256_file
 from protocol import MAX_CHUNK_SIZE, PROTOCOL_VERSION, ProtocolError, recv_frame, send_frame
 
@@ -23,13 +25,14 @@ class RequestError(Exception):
 class FileServer:
     def __init__(
         self,
-        file_path: str | Path,
+        file_path: str | Path | FileStore,
         host: str,
         port: int,
         read_timeout: float = 60.0,
     ):
-        path = Path(file_path).resolve()
-        if not path.is_file():
+        self._store = file_path if isinstance(file_path, FileStore) else None
+        path = None if self._store is not None else Path(file_path).resolve()
+        if path is not None and not path.is_file():
             raise ValueError(f"configured file does not exist: {path}")
         if not host:
             raise ValueError("host must not be empty")
@@ -42,8 +45,8 @@ class FileServer:
         self.host = host
         self.port = port
         self.read_timeout = float(read_timeout)
-        self.file_size = path.stat().st_size
-        self.file_sha256 = sha256_file(path)
+        self.file_size = path.stat().st_size if path is not None else 0
+        self.file_sha256 = sha256_file(path) if path is not None else ""
 
         self._listener: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
@@ -64,10 +67,17 @@ class FileServer:
             raise RuntimeError("server has already started")
 
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((self.host, self.port))
-        listener.listen()
-        listener.settimeout(0.2)
+        try:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((self.host, self.port))
+            listener.listen()
+            listener.settimeout(0.2)
+        except OSError:
+            listener.close()
+            raise
         self._listener = listener
         self._stopped.clear()
         self._accept_thread = threading.Thread(
@@ -135,6 +145,9 @@ class FileServer:
                 daemon=True,
             )
             with self._state_lock:
+                if self._stopped.is_set():
+                    client.close()
+                    return
                 self._clients.add(client)
                 self._client_threads.add(thread)
             thread.start()
@@ -157,8 +170,8 @@ class FileServer:
                     self._dispatch(client, header)
                 except RequestError as exc:
                     self._send_error(client, exc.code, exc.message)
-                except OSError:
-                    self._send_error(client, "INTERNAL_ERROR", "unable to read configured file")
+                except (OSError, sqlite3.Error):
+                    self._send_error(client, "INTERNAL_ERROR", "unable to read catalogue or file")
         except OSError:
             pass
         finally:
@@ -173,37 +186,66 @@ class FileServer:
     def _dispatch(self, client: socket.socket, header: dict[str, Any]) -> None:
         message_type = header["type"]
         if message_type == "FILE_INFO_REQUEST":
-            self._validate_filename(header)
+            entry = self._lookup_file(header)
             send_frame(
                 client,
                 {
                     "version": PROTOCOL_VERSION,
                     "type": "FILE_INFO_RESPONSE",
                     "status": "OK",
-                    "filename": self.file_path.name,
-                    "file_size": self.file_size,
-                    "file_sha256": self.file_sha256,
+                    **self._metadata(entry),
                 },
             )
             return
         if message_type == "GET_CHUNK":
             self._send_chunk(client, header)
             return
+        if message_type == "LIST_FILES":
+            self._send_catalogue(client, header)
+            return
         raise RequestError("INVALID_REQUEST", f"unsupported message type: {message_type}")
 
-    def _validate_filename(self, header: dict[str, Any]) -> None:
-        if header.get("filename") != self.file_path.name:
-            raise RequestError("FILE_NOT_FOUND", "requested file is not configured")
+    @staticmethod
+    def _metadata(entry: StoredFile) -> dict[str, Any]:
+        return {"filename": entry.name, "file_size": entry.size, "file_sha256": entry.digest}
+
+    def _lookup_file(self, header: dict[str, Any]) -> StoredFile:
+        name = header.get("filename")
+        if isinstance(name, str):
+            if self._store is not None:
+                entry = self._store.get(name)
+                if entry is not None:
+                    return entry
+            elif self.file_path is not None and self.file_path.name == name:
+                return StoredFile(name, self.file_size, self.file_sha256, self.file_path)
+        raise RequestError("FILE_NOT_FOUND", "requested file is not configured")
+
+    def _send_catalogue(self, client: socket.socket, header: dict[str, Any]) -> None:
+        after = header.get("after")
+        if after is not None and (not isinstance(after, str) or len(after) > 255):
+            raise RequestError("INVALID_REQUEST", "invalid catalogue cursor")
+        page_size = 40
+        if self._store is not None:
+            entries = self._store.page(after, page_size + 1)
+        elif self.file_path is not None and self.file_path.name > (after or ""):
+            entries = [self._lookup_file({"filename": self.file_path.name})]
+        else:
+            entries = []
+        send_frame(client, {
+            "version": PROTOCOL_VERSION, "type": "FILE_LIST", "status": "OK",
+            "files": [self._metadata(entry) for entry in entries[:page_size]],
+            "next_after": entries[page_size - 1].name if len(entries) > page_size else None,
+        })
 
     def _send_chunk(self, client: socket.socket, header: dict[str, Any]) -> None:
-        self._validate_filename(header)
+        entry = self._lookup_file(header)
         chunk_id = self._required_non_negative_int(header, "chunk_id")
         offset = self._required_non_negative_int(header, "offset")
         length = self._required_non_negative_int(header, "length")
-        if length == 0 or length > MAX_CHUNK_SIZE or offset + length > self.file_size:
+        if length == 0 or length > MAX_CHUNK_SIZE or offset + length > entry.size:
             raise RequestError("INVALID_RANGE", "requested range is outside the file")
 
-        with self.file_path.open("rb") as source:
+        with entry.path.open("rb") as source:
             source.seek(offset)
             payload = source.read(length)
         if len(payload) != length:
