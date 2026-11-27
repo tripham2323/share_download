@@ -9,6 +9,22 @@ Tài liệu này tổng hợp toàn bộ bản chất kỹ thuật, cấu trúc 
 - **Mục tiêu:** Tăng tốc độ tải file và tăng tính sẵn sàng (Fault Tolerance) bằng cách tải đồng thời các mảnh (chunks) của một file từ nhiều Server khác nhau.
 - **Mô hình:** Client-Server kết hợp cơ chế Cân bằng tải động (Dynamic Load Balancing) ở phía Client.
 
+### Kịch bản demo bản desktop
+
+1. Mở Demo với ba kho độc lập và mở client C1. Dừng S3 trong tab của nó.
+2. Trên S2, thêm một tệp chưa có trong cụm và chọn **Phát hành cho cả cụm**.
+   Khi S1 và S2 xác minh xong, S3 còn **Chưa xác nhận**.
+3. Bật S3; xác nhận chuyển sang `3/3`. C1 chọn tệp từ danh mục và bắt đầu tải.
+   Dừng một node đang gửi; các nguồn còn lại tiếp tục. Dùng tệp đủ lớn hoặc giới hạn
+   đường truyền trong VM để phiên tải không xong trước khi thao tác.
+4. So sánh SHA-256 tệp đầu ra với hash đã công bố; phân biệt **đủ byte** với **xác minh xong**.
+
+**Liên hệ Java RMI:** [Oracle](https://docs.oracle.com/en/java/javase/21/docs/specs/rmi/objmodel.html)
+mô tả giao diện từ xa, tham chiếu đối tượng và cách phân biệt lỗi truyền thông.
+ShareDownload tham khảo cách tách hợp đồng gọi, tra cứu endpoint theo danh tính và adapter phía gọi;
+các thao tác thực tế dùng SDP/TCP và HTTPS, không dùng JVM, `Registry` hay Java RMI. Việc giữ
+ba bản sao và xử lý node offline là logic của ứng dụng, không phải tính năng tự có của RMI.
+
 ---
 
 ## 2. CÁC "PROBLEM" THỰC TẾ & "CODE GIẢI PHÁP" CỦA DỰ ÁN

@@ -2,21 +2,60 @@
 
 Chương trình tải đồng thời một tệp từ nhiều máy chủ bằng Python và TCP. Máy khách chia tệp thành các chunk, phân phối chunk động cho S1, S2, S3, ghép dữ liệu theo đúng offset và xác minh SHA-256 trước khi công bố tệp kết quả.
 
+## Mở nhanh — Windows x64
+
+**Có bộ portable:** giải nén nguyên thư mục `ShareDownload` và giữ `_internal`. Mở
+`ShareDownload-Demo.exe` để chạy S1/S2/S3 trong ba tab với ba kho riêng. Đợi `config.dat`
+được xác nhận trên cả ba node, rồi mở `ShareDownload-Client.exe` và tải. Không cần cài Python.
+`ShareDownload-Server.exe` dùng khi chạy một node trên mỗi máy.
+Tải artifact `ShareDownload-Windows-x64` từ lần chạy thành công của workflow
+[Windows portable](https://github.com/tripham2323/share_download/actions/workflows/windows-portable.yml).
+
+**Chạy từ mã nguồn:** cài một lần `python -m pip install -r requirements-desktop.txt`, rồi double-click
+`Run Demo.cmd`, `Run Client.cmd` hoặc `Run Server.cmd`. Có thể dùng `.venv` tại gốc repo.
+Trên nền tảng khác, chạy `python launcher.py demo|client|server` (chọn một chế độ).
+
+**Tạo bộ portable:** trên Windows x64, chạy `python -m pip install -r requirements-portable.txt`
+rồi `python build_portable.py`. Chép **cả** `dist/ShareDownload` sang máy đích. Cấu hình,
+tệp tải và `server-data/` được ghi ngoài `_internal`; đặt bundle trong thư mục bạn có quyền ghi.
+Không phân phối lại thư mục runtime đã chứa tệp, credential hay log.
+
+### Thiết lập ba máy LAN
+
+1. Trên mỗi server, mở app và chọn đúng vai trò S1, S2 hoặc S3. Trong **Hồ sơ địa chỉ LAN**,
+   điền IP LAN và cổng của ba máy, xuất hồ sơ công khai và nhập cùng hồ sơ trên các máy khác.
+   Chọn **Áp dụng máy này** trên mỗi server. C1 nhập hồ sơ này trong cấu hình.
+2. Nếu cần đồng bộ, trên S1 chọn **Tạo cụm…** với IPv4/DNS ổn định mà S2/S3 truy cập được
+   và cổng HTTPS riêng (mặc định `5100`). Xuất lời mời riêng cho từng S2/S3 và nhập đúng máy.
+   Lời mời chứa thông tin xác thực; không chia sẻ với C1, không commit và xóa bản chuyển giao
+   sau khi đã nhập. Nếu chỉ chia sẻ cục bộ, bỏ qua bước này.
+3. Cho phép TCP cổng tải vào từng server trong mạng tin cậy; khi bật đồng bộ, cho phép thêm
+   TCP cổng HTTPS vào **S1** từ các node. Không tắt firewall hoặc chuyển tiếp cổng ra Internet.
+   Trên từng node, chọn **Bật phục vụ**. Bind `127.0.0.1` chỉ dùng trên cùng một máy.
+4. Chọn **Thêm tệp…** và phạm vi. **Chỉ máy này** không tạo bản sao; **Phát hành cho cả cụm**
+   gửi vào S1 và các node còn lại tự kéo. Không ghi đè cùng tên khác hash: đặt tên mới.
+   Thử kết nối bằng ứng dụng hoặc `Test-NetConnection <IP> -Port <cổng>`.
+
+Nếu S1 mất kết nối, các bản sao đã xác minh vẫn phục vụ; phát hành mới cần S1.
+Chỉ số `3/3` là ba bản sao đã xác nhận SHA-256, **không** phải ba node hiện online.
+SDP phục vụ tải trên LAN tin cậy; kênh phát hành riêng dùng TLS và lời mời theo node.
+Giới hạn mỗi tệp nhập kho là 4 GiB.
+
 ## Tính năng
 
-- Tải `config.dat` đồng thời từ nhiều server.
+- Chọn tệp từ danh mục và tải đồng thời từ các server có cùng phiên bản.
 - Tự thích nghi với băng thông khác nhau: server nhanh hoàn thành nhiều chunk hơn.
 - TCP xử lý mất gói, sắp xếp lại dữ liệu và truyền lại.
 - SHA-256 cho từng chunk và toàn bộ tệp.
 - Tiếp tục tải bằng các server còn lại khi một server ngắt kết nối.
 - Phát hiện server chứa phiên bản file khác.
 - Chạy được trên localhost, VMware và nhiều máy thật.
-- CLI và giao thức TCP chỉ dùng Python standard library; giao diện desktop dùng PySide6 cài riêng.
+- CLI tải qua TCP chỉ cần Python standard library. GUI dùng PySide6; đồng bộ server dùng `cryptography`.
 
-## Yêu cầu
+## Yêu cầu khi chạy CLI hoặc từ mã nguồn
 
 - Python 3.11 trở lên.
-- Các server phải chứa tệp có cùng tên `config.dat`.
+- Để tải đa nguồn, các server cần có bản sao cùng tên, kích thước và SHA-256.
 - Khi chạy trên nhiều máy, client phải kết nối được tới địa chỉ IP và TCP port của từng server.
 
 Kiểm tra Python:
@@ -90,9 +129,9 @@ python desktop_app.py
 
 Trên Linux/macOS, dùng `source .venv/bin/activate` thay lệnh kích hoạt PowerShell.
 Ứng dụng nạp `client_config.json` nếu có, nếu không nạp `client_config.example.json`.
-Vào **Cấu hình máy chủ** để sửa tên/IP/port, tên tệp, nơi lưu và tùy chọn nâng cao; lưu JSON qua **Lưu cấu hình…**.
+Vào cấu hình nguồn để sửa tên/IP/port, chọn tệp, nơi lưu và tùy chọn nâng cao; có thể nhập/xuất JSON.
 Đường dẫn `output` tương đối được tính từ thư mục chứa file cấu hình.
-Trên **Tổng quan phiên tải**, chọn **Kiểm tra máy chủ** rồi **Bắt đầu tải**.
+Tra danh mục từ server để chọn tệp, hoặc nhập tên thủ công với server đời cũ.
 Giao diện truy vấn metadata và tải ngoài luồng UI, thể hiện tốc độ, byte/chunk từng nguồn, tiến độ, ETA,
 log chuyển chunk và kết quả SHA-256. **Báo cáo phiên tải** có nút sao chép hash và mở thư mục kết quả;
 biểu đồ chỉ vẽ khi có ít nhất hai mẫu tốc độ thật.
@@ -103,8 +142,8 @@ Mở lại ứng dụng sẽ lấy metadata mới, đối chiếu checkpoint và
 **Tiếp tục tải**. Chunk sai được tải lại; chunk đúng không cần yêu cầu qua mạng.
 Nếu metadata, kích thước chunk hoặc dữ liệu tạm không khớp, ứng dụng giữ nguyên dữ liệu cũ;
 chỉ **Tải lại từ đầu** sau xác nhận mới thay thế dữ liệu `.part`.
-Nếu file đích đã tồn tại, ứng dụng hỏi trước khi ghi đè. CLI mặc định vẫn tải mới như trước;
-chế độ khôi phục này chỉ được bật từ giao diện.
+Nếu file đích đã tồn tại, giao diện hỏi trước khi ghi đè. CLI mặc định tải mới;
+dùng `--resume` nếu muốn tiếp tục phiên hỗ trợ checkpoint.
 
 
 # Chạy trên một máy

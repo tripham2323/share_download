@@ -1,0 +1,37 @@
+name: Windows portable
+
+on:
+  push:
+    paths:
+      - '**.py'
+      - '**.spec'
+      - 'requirements*.txt'
+      - 'client_config.example.json'
+      - 'Portable.txt'
+      - '.github/workflows/windows-portable.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: x64
+      - run: python -m pip install -r requirements-portable.txt pytest
+      - name: Verify desktop and sync behavior
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests/test_file_store.py tests/test_cluster_sync.py tests/test_server_desktop.py tests/test_desktop.py
+      - run: python build_portable.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShareDownload-Windows-x64
+          path: dist/ShareDownload/
+          if-no-files-found: error

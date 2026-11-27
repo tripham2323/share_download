@@ -12,3 +12,7 @@ downloads/*
 *.log
 data/*.dat
 .superpowers/
+/.taste-skill/
+/build/
+/dist/
+/server-data/

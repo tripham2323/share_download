@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 from checkpoint import state_path_for
 try:
@@ -13,13 +12,13 @@ except ImportError as exc:
     raise SystemExit("Install desktop dependencies: python -m pip install -r requirements-desktop.txt") from exc
 
 from desktop.window import MainWindow
+from runtime_paths import APP_DIR
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     window = MainWindow()
-    base_dir = Path(__file__).resolve().parent
-    for path in (base_dir / "client_config.json", base_dir / "client_config.example.json"):
+    for path in (APP_DIR / "client_config.json", APP_DIR / "client_config.example.json"):
         if path.is_file():
             try:
                 window.config_form.load_file(path)

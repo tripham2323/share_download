@@ -1,0 +1,22 @@
+SHAREDOWNLOAD | CHAY KHONG CAN CAI PYTHON
+
+Giai nen va giu nguyen ca thu muc, gom _internal. Mo tren Windows x64.
+
+Demo mot may:
+1. Mo ShareDownload-Demo.exe. Ba tab S1/S2/S3 co kho tach rieng.
+2. Cho dong config.dat co xac nhan tu ca ba may.
+3. Mo ShareDownload-Client.exe, tai config.dat vao downloads.
+
+Ba may LAN:
+1. Mo ShareDownload-Server.exe tren moi may va chon S1, S2 hoac S3.
+2. Dung Ho so dia chi LAN de nhap/xuat IPv4 va cong; ap dung tren
+   tung server. May C1 mo ShareDownload-Client.exe va nhap ho so.
+3. Neu can dong bo: tao cum tren S1 voi IP/DNS LAN cua S1, xuat
+   loi moi rieng cho S2/S3, roi nhap loi moi tren dung server.
+4. Bat phuc vu cac server. Chi mo TCP cong tai tren LAN tin cay.
+   Neu dong bo, chi S1 can mo them cong HTTPS dong bo (mac dinh 5100).
+5. Them tep tren server va chon pham vi. C1 chon tep tu danh muc.
+
+server-data chua du lieu va thong tin rieng. Khong phat tan lai
+thu muc da chay server-data, loi moi rieng, hoac tep da tai.
+Giu _internal de chay; khong sua tep ben trong _internal.
